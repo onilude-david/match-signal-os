@@ -1,0 +1,16 @@
+The Match Signal picture files to upload/download:
+
+1. match-signal-logo-icon-1024.png
+   Use for Instagram, TikTok, X, Threads, YouTube, Facebook, Telegram profile picture.
+
+2. match-signal-logo-primary-1200.png
+   Use as the main square logo and backup profile image.
+
+3. match-signal-wordmark-1800x420.png
+   Use for banners, covers, headers, Google Drive previews, and documents.
+
+All picture files are in this same folder:
+C:\Users\onilu\OneDrive\Documents\Word Cup Project\artifacts\brand
+
+A zip with all assets is here:
+C:\Users\onilu\OneDrive\Documents\Word Cup Project\artifacts\The-Match-Signal-Brand-Kit.zip

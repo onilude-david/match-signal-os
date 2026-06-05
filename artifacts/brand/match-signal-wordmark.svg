@@ -1,0 +1,14 @@
+<svg width="1800" height="420" viewBox="0 0 1800 420" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">The Match Signal wordmark</title>
+  <desc id="desc">The Match Signal wordmark with logo icon and brand name.</desc>
+  <rect width="1800" height="420" rx="44" fill="#F7F0E2"/>
+  <g transform="translate(80 60)">
+    <rect width="300" height="300" rx="58" fill="#17211E"/>
+    <circle cx="150" cy="150" r="104" fill="#13513F" stroke="#C8962F" stroke-width="10"/>
+    <text x="150" y="178" fill="#F7F0E2" font-family="Arial Black, Segoe UI, Aptos, Arial, sans-serif" font-size="76" font-weight="900" text-anchor="middle">MS</text>
+    <path d="M84 226H216" stroke="#C8962F" stroke-width="12" stroke-linecap="round"/>
+  </g>
+  <text x="440" y="178" fill="#17211E" font-family="Segoe UI, Aptos, Arial, sans-serif" font-size="92" font-weight="800" letter-spacing="0">The Match Signal</text>
+  <text x="444" y="254" fill="#13513F" font-family="Segoe UI, Aptos, Arial, sans-serif" font-size="38" font-weight="700" letter-spacing="3">FOOTBALL INTELLIGENCE FOR MATCHDAY MOMENTUM</text>
+  <path d="M445 302H1510" stroke="#C8962F" stroke-width="10" stroke-linecap="round"/>
+</svg>

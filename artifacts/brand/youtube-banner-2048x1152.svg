@@ -1,0 +1,19 @@
+<svg width="2048" height="1152" viewBox="0 0 2048 1152" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">The Match Signal YouTube banner</title>
+  <desc id="desc">2048 by 1152 YouTube channel banner for The Match Signal.</desc>
+  <rect width="2048" height="1152" fill="#17211E"/>
+  <rect x="0" y="0" width="2048" height="1152" fill="#17211E"/>
+  <circle cx="268" cy="576" r="420" fill="#13513F" opacity="0.34"/>
+  <circle cx="1780" cy="576" r="420" fill="#254E70" opacity="0.22"/>
+  <path d="M0 860H2048" stroke="#C8962F" stroke-width="12" opacity="0.95"/>
+  <path d="M0 292H2048" stroke="#13513F" stroke-width="6" opacity="0.6"/>
+  <g transform="translate(807 346)">
+    <rect width="434" height="434" rx="82" fill="#17211E"/>
+    <circle cx="217" cy="217" r="145" fill="#13513F" stroke="#C8962F" stroke-width="16"/>
+    <path d="M121 295H313" stroke="#C8962F" stroke-width="14" stroke-linecap="round"/>
+    <text x="217" y="255" fill="#F7F0E2" font-family="Arial Black, Segoe UI, Aptos, Arial, sans-serif" font-size="112" font-weight="900" text-anchor="middle">MS</text>
+  </g>
+  <text x="1024" y="276" fill="#F7F0E2" font-family="Segoe UI, Aptos, Arial, sans-serif" font-size="96" font-weight="900" text-anchor="middle" letter-spacing="0">The Match Signal</text>
+  <text x="1024" y="894" fill="#C8962F" font-family="Segoe UI, Aptos, Arial, sans-serif" font-size="42" font-weight="800" text-anchor="middle" letter-spacing="4">FOOTBALL INTELLIGENCE FOR MATCHDAY MOMENTUM</text>
+  <text x="1024" y="956" fill="#F7F0E2" font-family="Segoe UI, Aptos, Arial, sans-serif" font-size="34" font-weight="650" text-anchor="middle">Previews · Tactical Signals · Upset Watch · Post-Match Lessons</text>
+</svg>

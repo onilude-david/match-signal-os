@@ -1,0 +1,10 @@
+<svg width="1200" height="1200" viewBox="0 0 1200 1200" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">The Match Signal primary logo</title>
+  <desc id="desc">Circular deep green logo mark with signal gold monogram and football pitch signal lines.</desc>
+  <rect width="1200" height="1200" rx="220" fill="#17211E"/>
+  <circle cx="600" cy="600" r="392" fill="#13513F"/>
+  <circle cx="600" cy="600" r="392" stroke="#C8962F" stroke-width="34"/>
+  <path d="M334 805H866" stroke="#C8962F" stroke-width="34" stroke-linecap="round"/>
+  <text x="472" y="700" fill="#F7F0E2" font-family="Arial Black, Segoe UI, Aptos, Arial, sans-serif" font-size="300" font-weight="900" text-anchor="middle">M</text>
+  <text x="724" y="700" fill="#F7F0E2" font-family="Arial Black, Segoe UI, Aptos, Arial, sans-serif" font-size="300" font-weight="900" text-anchor="middle">S</text>
+</svg>

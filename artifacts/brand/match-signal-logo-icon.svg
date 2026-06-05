@@ -1,0 +1,9 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">The Match Signal icon</title>
+  <desc id="desc">Deep green app icon with signal gold border and match signal monogram.</desc>
+  <rect width="1024" height="1024" rx="190" fill="#17211E"/>
+  <circle cx="512" cy="512" r="338" fill="#13513F" stroke="#C8962F" stroke-width="34"/>
+  <path d="M288 696H736" stroke="#C8962F" stroke-width="32" stroke-linecap="round"/>
+  <text x="406" y="605" fill="#F7F0E2" font-family="Arial Black, Segoe UI, Aptos, Arial, sans-serif" font-size="250" font-weight="900" text-anchor="middle">M</text>
+  <text x="620" y="605" fill="#F7F0E2" font-family="Arial Black, Segoe UI, Aptos, Arial, sans-serif" font-size="250" font-weight="900" text-anchor="middle">S</text>
+</svg>

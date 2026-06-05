@@ -1,0 +1,37 @@
+{
+  "fixtures": [
+    {
+      "id": "fd-537327",
+      "date": "2026-06-11",
+      "time": "19:00",
+      "teamA": "Mexico",
+      "teamB": "South Africa",
+      "stage": "GROUP_STAGE / GROUP_A",
+      "venue": "World",
+      "status": "Scheduled",
+      "contentStatus": "Approved",
+      "homeOdds": null,
+      "drawOdds": null,
+      "awayOdds": null
+    }
+  ],
+  "ratings": [],
+  "accuracy": [],
+  "aiContent": {
+    "fd-537327": {
+      "telegram": "🇲🇽 Mexico vs South Africa 🇿🇦: A World Cup Group A opener with no clear lean! Our model flags a tight 1-1. The first goal and control phases are the immediate signal points. Watch for Mexico's central creator to dictate play. #MEXRSA #WorldCupTactics",
+      "xPost": "No clear lean for Mexico vs South Africa, with a tight 1-1 expected. The first goal and control phases will be pivotal in this Group A opener. Who wins the midfield battle? #MEXRSA #WorldCup #MatchSignal",
+      "thread": "1/3: 🇲🇽 Mexico vs South Africa 🇿🇦: A World Cup Group A opener with no clear lean, our model anticipates a tight 1-1. The first goal and how each team navigates the control phases are the key signal points. #MEXRSA #WorldCup\n\n2/3: If Mexico scores first, South Africa will face early pressure to adapt, potentially opening up transition opportunities. The match then becomes a critical test of Mexico's ability to maintain control. #TacticalContext\n\n3/3: Should the game remain level deep into the second half, expect set pieces, substitutions, and emotional pressure to become the main swing factors. Game-state discipline will be paramount to navigate late volatility. #GameStateAnalysis",
+      "shortsScript": "[Dynamic intro music/graphics]\n\n**Visual:** Quick cuts of Mexico and South Africa players, then a scoreboard showing '1-1' with a question mark.\n\n**Voiceover:** \"Mexico vs South Africa: A World Cup opener full of questions! Our model sees no clear lean, predicting a tight 1-1 scoreline. The first goal? It's EVERYTHING.\"\n\n**Visual:** Highlight reel of a central midfielder playing a key pass, then a tense midfield battle.\n\n**Voiceover:** \"Will Mexico's central creator unlock a disciplined South Africa? Or will this become a grind? Control phases are paramount. The team that dictates the tempo, dictates the match.\"\n\n**Visual:** Clock ticking past 60 minutes, then a set-piece situation or a dramatic substitution.\n\n**Voiceover:** \"And if it's level deep into the second half... get ready for chaos! Set pieces, substitutions, and emotional pressure will spark late drama. Game-state discipline will be crucial.\"\n\n**Visual:** Match Signal logo.\n\n**Voiceover:** \"Who do YOU think will seize control? Let us know!\"",
+      "videoTitle": "Mexico vs South Africa: The Control Test & First Goal Deciders | World Cup Group A Preview",
+      "reportSection": "### Match Narrative: Mexico vs South Africa - Group A Opener\nThis World Cup Group A clash between Mexico and South Africa presents a fascinating tactical challenge. Our analysis indicates 'no clear lean' for either side, with an expected score of 1-1, highlighting the potential for a tightly contested affair. The immediate signal points revolve entirely around the first goal and how quickly either side can establish and maintain control phases within the match.\n\n### Tactical Focus & Key Player\nMexico's central creator is identified as a pivotal figure, whose ability to dictate tempo and unlock South Africa's defensive shape will be crucial. This individual's influence could be the differentiator in a game where midfield dominance is expected to be a key battleground. The 'Medium' upset risk and 'Medium' goal potential further underscore the finely balanced nature of this encounter.\n\n### Scenarios & Game State Dynamics\n**If Mexico scores first:** This scenario would immediately test South Africa's tactical resilience. Bafana Bafana would be forced to open up earlier than planned, inevitably raising their transition risk. For Mexico, the focus would then shift to a crucial 'control test' – can they manage the game effectively and exploit the newly created spaces?\n\n**If the game is still level after 60 minutes:** Deep into the second half, with the score unchanged, the match dynamics will shift dramatically. Set pieces will become high-leverage moments, substitutions will carry significant weight, and emotional pressure will intensify. Briefings around game-state discipline and preparing for late volatility will be essential for both teams, as moments of individual brilliance or error could decide the outcome.",
+      "bettingAngle": "Market attention for Mexico vs South Africa will likely be concentrated on first-half dynamics and potential goal scorers, given the expected tight scoreline of 1-1. The 'no clear lean' prediction indicates a high degree of uncertainty, which could translate into notable in-play odds volatility, particularly if the score remains level past the 60-minute mark. Narrative momentum will build rapidly around which team establishes early control and how effectively they dictate the tempo.",
+      "safetyNotes": [
+        "All analysis focuses on football strategy and match dynamics, not financial or betting advice.",
+        "Content is for entertainment and informational purposes, promoting responsible engagement with football analysis.",
+        "The inherent unpredictability of football means outcomes are never guaranteed, regardless of pre-match analysis."
+      ]
+    }
+  },
+  "savedAt": "2026-06-04T20:40:38.924Z"
+}
