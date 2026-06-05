@@ -7,8 +7,12 @@
     "dev": "concurrently \"npm:dev:api\" \"npm:dev:web\"",
     "dev:web": "vite --host 127.0.0.1",
     "dev:api": "node server/index.mjs",
+    "start": "node server/index.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.86.0",

@@ -12,6 +12,15 @@ npm run dev
 Frontend: `http://127.0.0.1:5173`
 Backend: `http://127.0.0.1:8787/api/health`
 
+For hosted Node deployments:
+
+```bash
+npm run build
+npm start
+```
+
+The Express server serves both the API and the built frontend from the same port.
+
 ## API Setup
 
 Copy `.env.example` to `.env`, fill the keys, then restart `npm run dev`.
