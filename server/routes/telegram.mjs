@@ -6,6 +6,8 @@ import {
   telegramPolling,
   handleTelegramUpdate,
 } from "../services/telegram.mjs";
+import { publicSafetyMiddleware, publicSafetyCheck } from "../services/safetyFilter.mjs";
+import { computePicks, buildVipMessage, responsibleGamblingFooter } from "../services/picks.mjs";
 
 const router = express.Router();
 
@@ -17,6 +19,16 @@ const telegramCommands = [
   { command: "stats", description: "Show operator stats" },
   { command: "help", description: "Show Match Signal commands" },
 ];
+
+// Operator-configurable jurisdictional gate. Comma-separated list of allowed
+// jurisdictions (free-text labels — operator decides what the channel covers).
+// Empty means VIP publishing is disabled. This is intentionally simple: no IP
+// geo, just an explicit operator opt-in per region the channel is allowed in.
+const vipPublishingEnabled = () => {
+  if (process.env.VIP_PUBLISH_ENABLED === "false") return false;
+  const jurisdictions = String(process.env.VIP_JURISDICTIONS ?? "").trim();
+  return Boolean(process.env.TELEGRAM_BETTING_CHANNEL_ID) && jurisdictions.length > 0;
+};
 
 // POST /api/telegram/send
 router.post("/send", async (req, res) => {
@@ -46,7 +58,9 @@ router.get("/status", async (_req, res) => {
       commands: commands.result,
       adminConfigured: Boolean(process.env.TELEGRAM_ADMIN_CHAT_ID),
       publicChannelConfigured: Boolean(process.env.TELEGRAM_PUBLIC_CHANNEL_ID),
-      bettingChannelConfigured: Boolean(process.env.TELEGRAM_BETTING_CHANNEL_ID),
+      vipChannelConfigured: Boolean(process.env.TELEGRAM_BETTING_CHANNEL_ID),
+      vipPublishEnabled: vipPublishingEnabled(),
+      vipJurisdictions: String(process.env.VIP_JURISDICTIONS ?? "").trim(),
     });
   } catch (error) {
     jsonError(res, 502, error.message);
@@ -74,18 +88,24 @@ router.get("/polling/status", (_req, res) => {
 });
 
 // POST /api/telegram/webhook
+// Always respond 2xx to Telegram. A non-2xx response causes Telegram to retry
+// the same update indefinitely, which can stampede the bot.
 router.post("/webhook", async (req, res) => {
   if (!assertEnv(res, "TELEGRAM_BOT_TOKEN")) return;
   try {
     await handleTelegramUpdate(req.body);
     res.json({ ok: true });
   } catch (error) {
-    jsonError(res, 502, "Telegram webhook update failed.", error.message);
+    console.error("[telegram/webhook] handler error:", error?.message ?? error);
+    // 200 with ok:false: handler failed but we don't want Telegram retries.
+    res.status(200).json({ ok: false, handled: false, error: error?.message ?? String(error) });
   }
 });
 
 // POST /api/telegram/preview
-router.post("/preview", async (req, res) => {
+// Operator inbox. Public-safe: anything sent here will likely go to public next,
+// so we hold it to the same standard. To preview a VIP message, use /vip/preview.
+router.post("/preview", publicSafetyMiddleware, async (req, res) => {
   if (!assertEnv(res, "TELEGRAM_BOT_TOKEN") || !assertEnv(res, "TELEGRAM_ADMIN_CHAT_ID")) return;
   const { text, parseMode, matchId } = req.body;
   if (!text) {
@@ -115,7 +135,8 @@ router.post("/preview", async (req, res) => {
 });
 
 // POST /api/telegram/public
-router.post("/public", async (req, res) => {
+// PUBLIC channel — strictest filter applied.
+router.post("/public", publicSafetyMiddleware, async (req, res) => {
   if (!assertEnv(res, "TELEGRAM_BOT_TOKEN") || !assertEnv(res, "TELEGRAM_PUBLIC_CHANNEL_ID")) return;
   const { text, parseMode } = req.body;
   if (!text) {
@@ -134,24 +155,133 @@ router.post("/public", async (req, res) => {
   }
 });
 
-// POST /api/telegram/betting
-router.post("/betting", async (req, res) => {
-  if (!assertEnv(res, "TELEGRAM_BOT_TOKEN") || !assertEnv(res, "TELEGRAM_BETTING_CHANNEL_ID")) return;
-  const { text, parseMode } = req.body;
+// POST /api/telegram/market-context
+// Public-safe market context (attention, volatility, pressure) for the
+// operator's admin inbox or the public channel. Replaces the old /betting
+// route which was confusingly named — that one is now deprecated below.
+router.post("/market-context", publicSafetyMiddleware, async (req, res) => {
+  if (!assertEnv(res, "TELEGRAM_BOT_TOKEN") || !assertEnv(res, "TELEGRAM_ADMIN_CHAT_ID")) return;
+  const { text, parseMode, target = "admin" } = req.body;
   if (!text) {
     jsonError(res, 400, "text is required.");
     return;
   }
+  const chatId = target === "public"
+    ? process.env.TELEGRAM_PUBLIC_CHANNEL_ID
+    : process.env.TELEGRAM_ADMIN_CHAT_ID;
+  if (target === "public" && !process.env.TELEGRAM_PUBLIC_CHANNEL_ID) {
+    return jsonError(res, 501, "TELEGRAM_PUBLIC_CHANNEL_ID is not configured.");
+  }
   try {
-    const result = await telegramSendMessage({
-      chatId: process.env.TELEGRAM_BETTING_CHANNEL_ID,
-      text,
-      parseMode,
-    });
+    const result = await telegramSendMessage({ chatId, text, parseMode });
     res.json({ ok: true, result });
   } catch (error) {
     jsonError(res, 502, error.message);
   }
+});
+
+// POST /api/telegram/betting  (DEPRECATED — 410 Gone)
+// Old route name. Returns a clear error so existing clients fail loudly rather
+// than silently publish unsafe content to the wrong channel.
+router.post("/betting", (_req, res) => {
+  res.status(410).json({
+    ok: false,
+    error: "/api/telegram/betting is deprecated.",
+    hint: "For public editorial market context use POST /api/telegram/market-context. For VIP picks use POST /api/telegram/vip (gated; see README VIP scope).",
+  });
+});
+
+// POST /api/telegram/vip/preview
+// Build a VIP picks message from the fixture + ratings, return the formatted
+// message body WITHOUT sending. Operator uses this to review before publish.
+router.post("/vip/preview", async (req, res) => {
+  const { fixture, teamRatings = [] } = req.body ?? {};
+  if (!fixture) {
+    return jsonError(res, 400, "fixture is required.");
+  }
+  const picks = computePicks(fixture, teamRatings);
+  const message = buildVipMessage(fixture, picks);
+  res.json({
+    ok: true,
+    picks,
+    message,
+    vipPublishEnabled: vipPublishingEnabled(),
+    jurisdictions: String(process.env.VIP_JURISDICTIONS ?? "").trim().split(",").map((s) => s.trim()).filter(Boolean),
+  });
+});
+
+// POST /api/telegram/vip
+// Publish picks to the VIP channel ONLY. Triple-gated:
+//   1. TELEGRAM_BOT_TOKEN must be configured
+//   2. TELEGRAM_BETTING_CHANNEL_ID must be configured
+//   3. VIP_JURISDICTIONS must be set (operator explicitly opts in per region)
+//   4. VIP_PUBLISH_ENABLED must not be "false"
+// Every successful publish writes an audit row {ts, fixtureId, picks[]} to
+// Supabase pick_log (best-effort — failure to log does not block the send,
+// but is reported in the response).
+router.post("/vip", async (req, res) => {
+  if (!assertEnv(res, "TELEGRAM_BOT_TOKEN")) return;
+  if (!assertEnv(res, "TELEGRAM_BETTING_CHANNEL_ID")) return;
+  if (!vipPublishingEnabled()) {
+    return res.status(403).json({
+      ok: false,
+      error: "VIP publishing is not enabled.",
+      hint: "Set VIP_JURISDICTIONS=US,UK,... and VIP_PUBLISH_ENABLED!=false in .env to enable. See README VIP scope.",
+    });
+  }
+
+  const { fixture, teamRatings = [], narrative = "" } = req.body ?? {};
+  if (!fixture) {
+    return jsonError(res, 400, "fixture is required.");
+  }
+
+  const picks = computePicks(fixture, teamRatings);
+  if (!picks.length) {
+    return res.status(200).json({
+      ok: false,
+      published: false,
+      reason: "No value picks at current prices. Nothing was published.",
+    });
+  }
+
+  const baseMessage = buildVipMessage(fixture, picks);
+  const message = narrative ? `${baseMessage}\n\nNote: ${narrative}` : baseMessage;
+
+  try {
+    const result = await telegramSendMessage({
+      chatId: process.env.TELEGRAM_BETTING_CHANNEL_ID,
+      text: message,
+    });
+
+    // Best-effort audit log
+    let audit = { logged: false };
+    try {
+      const { logPicks } = await import("../services/supabase.mjs");
+      if (typeof logPicks === "function") {
+        await logPicks({ fixture, picks });
+        audit = { logged: true };
+      }
+    } catch (logError) {
+      audit = { logged: false, error: logError?.message ?? String(logError) };
+    }
+
+    res.json({
+      ok: true,
+      published: true,
+      pickCount: picks.length,
+      picks,
+      audit,
+      result,
+    });
+  } catch (error) {
+    jsonError(res, 502, error.message);
+  }
+});
+
+// GET /api/telegram/vip/footer — returns the canonical RG footer so the
+// frontend can display it next to the publish button.
+router.get("/vip/footer", (_req, res) => {
+  res.json({ ok: true, footer: responsibleGamblingFooter() });
 });
 
 export default router;

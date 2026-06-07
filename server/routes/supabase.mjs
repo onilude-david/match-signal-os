@@ -189,14 +189,54 @@ router.post("/content", async (req, res) => {
     jsonError(res, 501, "SUPABASE_SERVICE_ROLE_KEY or SUPABASE_PUBLISHABLE_KEY is not configured. Add one to .env and restart the API server.");
     return;
   }
-  const { matchId, content } = req.body ?? {};
+  const { matchId, content, fixture } = req.body ?? {};
   if (!matchId || !content) {
     jsonError(res, 400, "matchId and content are required.");
     return;
   }
   try {
     const supabase = getSupabase();
-    const { error } = await supabase.from("content_outputs").upsert(contentRowFromContent(matchId, normalizeAiContent(content)), { onConflict: "match_id" });
+
+    // content_outputs has a FK to fixtures(match_id). If the caller provided a
+    // fixture payload, upsert it first; otherwise verify a row already exists
+    // so we can surface a clearer error than the raw 23503 FK violation.
+    if (fixture && fixture.id) {
+      let fixtureUpsert = await supabase
+        .from("fixtures")
+        .upsert(fixtureRowFromFixture({ ...fixture, id: matchId }), { onConflict: "match_id" });
+      if (fixtureUpsert.error && String(fixtureUpsert.error.message ?? "").match(/source_id|away_odds/)) {
+        fixtureUpsert = await supabase
+          .from("fixtures")
+          .upsert(withoutKeys(fixtureRowFromFixture({ ...fixture, id: matchId }), ["home_odds", "draw_odds", "away_odds", "source_id"]), { onConflict: "match_id" });
+      }
+      if (fixtureUpsert.error) {
+        jsonError(res, 502, "Supabase fixture upsert (pre-content) failed.", fixtureUpsert.error);
+        return;
+      }
+    } else {
+      const exists = await supabase.from("fixtures").select("match_id").eq("match_id", matchId).maybeSingle();
+      if (exists.error) {
+        jsonError(res, 502, "Supabase fixture lookup failed.", exists.error);
+        return;
+      }
+      if (!exists.data) {
+        jsonError(
+          res,
+          409,
+          `Fixture ${matchId} is not in the fixtures table yet. Pass { fixture: {...} } in the request body, or POST /api/supabase/fixture first.`,
+        );
+        return;
+      }
+    }
+
+    let { error } = await supabase
+      .from("content_outputs")
+      .upsert(contentRowFromContent(matchId, normalizeAiContent(content)), { onConflict: "match_id" });
+    if (error && String(error.message ?? "").includes("betting_angle")) {
+      ({ error } = await supabase
+        .from("content_outputs")
+        .upsert(withoutKeys(contentRowFromContent(matchId, normalizeAiContent(content)), ["betting_angle"]), { onConflict: "match_id" }));
+    }
     if (error) {
       jsonError(res, 502, "Supabase content upsert failed.", error);
       return;

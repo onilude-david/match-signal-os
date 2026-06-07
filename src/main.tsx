@@ -15,7 +15,9 @@ import {
   Instagram,
   Layers,
   Megaphone,
+  Mic,
   Palette,
+  Radar,
   Radio,
   RefreshCcw,
   Search,
@@ -23,11 +25,10 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  Wand2,
   Youtube,
   Send,
   Loader2,
-  Sun,
-  Moon,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import "./styles.css";
@@ -55,11 +56,19 @@ import {
   SocialPlatform,
   ClipPlan,
   RenderJob,
+  AspectKey,
+  Pick,
+  VipPreviewResponse,
+  VipPublishResponse,
+  ClipSuggestion,
+  ScanResult,
+  TranscriptCue,
 } from "./types";
 
 // Import components
 import { Metric } from "./components/Metric";
 import { LabeledInput } from "./components/LabeledInput";
+import { ClipTimeline, TimelineThumb, TimelineWaveform } from "./components/ClipTimeline";
 import { OutputPanel } from "./components/OutputPanel";
 import { TeamRatingEditor } from "./components/TeamRatingEditor";
 import { MatchIntelPanel } from "./components/MatchIntelPanel";
@@ -117,8 +126,8 @@ const brandPillars = [
     detail: "Package previews, live pivots, and recaps as one continuous story.",
   },
   {
-    title: "Fan-intelligent",
-    detail: "Respect passion, but keep the brand grounded in football intelligence.",
+    title: "Two tiers, one discipline",
+    detail: "Public surface is editorial only. The VIP channel carries value picks with EV, fractional Kelly stake, and a responsible-gambling footer — and never crosses back to public.",
   },
 ];
 
@@ -126,7 +135,8 @@ const voiceRules = [
   "Say what to watch, not what is guaranteed",
   "Use short sentences and concrete match language",
   "Avoid official World Cup affiliation claims",
-  "Keep betting language out of public social copy",
+  "Keep betting language out of public social copy — picks live only in the gated VIP channel",
+  "Every VIP send carries the 18+/RG footer; the public surface never mentions odds, books, units, or EV",
 ];
 
 const visualSystem = [
@@ -200,15 +210,23 @@ const socialKitFor = (fixture: Fixture, prediction: Prediction, marketContext: M
   ];
 };
 
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
 const useStoredState = <T,>(key: string, fallback: T) => {
   const [value, setValue] = useState<T>(() => {
     const stored = localStorage.getItem(key);
     return stored ? (JSON.parse(stored) as T) : fallback;
   });
 
-  const setStoredValue = (next: T) => {
-    setValue(next);
-    localStorage.setItem(key, JSON.stringify(next));
+  // Accept either a new value or a (prev -> next) updater, matching the
+  // React.useState contract. Pulls current value out of the React state so
+  // the stored value never lags behind the updater.
+  const setStoredValue = (next: T | ((prev: T) => T)) => {
+    setValue((current) => {
+      const resolved = typeof next === "function" ? (next as (prev: T) => T)(current) : next;
+      localStorage.setItem(key, JSON.stringify(resolved));
+      return resolved;
+    });
   };
 
   return [value, setStoredValue] as const;
@@ -545,6 +563,7 @@ Model notes: ${prediction.redFlags.join("; ") || "No major red flags from the cu
     shortsScript,
     videoTitle: `${fixture.teamA} vs ${fixture.teamB}: Match Signal Preview`,
     reportSection,
+    marketContext: "Market context pending. Generate AI content to unlock editorial pressure, attention, and volatility notes.",
     bettingAngle: "Market context pending. Generate AI content to unlock editorial pressure, attention, and volatility notes.",
     safetyNotes,
   };
@@ -604,7 +623,6 @@ const providerReady = (health: ProviderHealth | null, badge: ProviderBadge) => {
 };
 
 function App() {
-  const [theme, setTheme] = useStoredState<"light" | "dark">("match-signal-theme", "dark");
   const [fixtures, setFixtures] = useStoredState<Fixture[]>("match-signal-fixtures", seedFixtures);
   const [ratings, setRatings] = useStoredState<TeamRating[]>("match-signal-ratings", seedRatings);
   const [accuracy, setAccuracy] = useStoredState<AccuracyRecord[]>("match-signal-accuracy", []);
@@ -694,9 +712,30 @@ function App() {
   const [watermarkText, setWatermarkText] = useState("THE MATCH SIGNAL");
   const [headlineText, setHeadlineText] = useState("");
   const [captionText, setCaptionText] = useState("");
+  const [accentText, setAccentText] = useState("");
   const [gpuAcceleration, setGpuAcceleration] = useState(false);
   const [selectedJobsToMerge, setSelectedJobsToMerge] = useState<string[]>([]);
   const sourceVideoRef = React.useRef<HTMLVideoElement | null>(null);
+
+  // Next-gen clip engine state
+  const ALL_ASPECTS: AspectKey[] = ["9x16", "1x1", "16x9", "4x5"];
+  const [aspectSelection, setAspectSelection] = useStoredState<AspectKey[]>(
+    "match-signal-aspects",
+    ALL_ASPECTS,
+  );
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [transcriptCues, setTranscriptCues] = useState<TranscriptCue[]>([]);
+  const [whisperConfigured, setWhisperConfigured] = useState<boolean | null>(null);
+  const [timelineThumbs, setTimelineThumbs] = useState<TimelineThumb[]>([]);
+  const [timelineWave, setTimelineWave] = useState<TimelineWaveform | null>(null);
+  const [timelineDuration, setTimelineDuration] = useState(0);
+  const [timelineFps, setTimelineFps] = useState(30);
+
+  const toggleAspect = (key: AspectKey) => {
+    setAspectSelection((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
+    );
+  };
 
   useEffect(() => {
     if (selectedClip) {
@@ -752,6 +791,37 @@ function App() {
       cancelled = true;
     };
   }, [selectedFixture.id, prediction.winnerLean, prediction.expectedScore, content.videoTitle]);
+
+  // Auto-recompute VIP picks when the selected fixture, its odds, or ratings change.
+  // Picks are pure math server-side, so this is cheap and always reflects current state.
+  useEffect(() => {
+    if (!selectedFixture?.id) return;
+    if (!selectedFixture.homeOdds || !selectedFixture.awayOdds) {
+      setVipPicks([]);
+      setVipMessage("");
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await api<VipPreviewResponse>("/api/telegram/vip/preview", {
+          method: "POST",
+          body: JSON.stringify({ fixture: selectedFixture, teamRatings: ratings }),
+        });
+        if (cancelled) return;
+        setVipPicks(result.picks ?? []);
+        setVipMessage(result.message ?? "");
+        setVipPublishEnabled(Boolean(result.vipPublishEnabled));
+        setVipJurisdictions(result.jurisdictions ?? []);
+      } catch {
+        if (!cancelled) {
+          setVipPicks([]);
+          setVipMessage("");
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedFixture.id, selectedFixture.homeOdds, selectedFixture.drawOdds, selectedFixture.awayOdds, ratings]);
 
   const snapshot = (): AppSnapshot => ({ fixtures, ratings, accuracy, aiContent });
 
@@ -860,13 +930,51 @@ function App() {
 
   const checkVideoEngine = async () => {
     setLoading((prev) => ({ ...prev, checkVideoEngine: true }));
+    type EngineStatus = {
+      ok: boolean;
+      ffmpeg: { configured: boolean; version?: string; error?: string };
+      whisper?: { configured: boolean; modelPath: string };
+      outputDir: string;
+    };
     try {
-      const result = await api<{ ok: boolean; ffmpeg: { configured: boolean; version?: string; error?: string }; outputDir: string }>("/api/video/status");
-      setApiMessage(result.ffmpeg.configured ? `Video engine ready: ${result.ffmpeg.version}` : `FFmpeg unavailable: ${result.ffmpeg.error}`);
+      const result = await api<EngineStatus>("/api/video/status");
+      setWhisperConfigured(result.whisper?.configured ?? false);
+      const ffmpegLine = result.ffmpeg.configured
+        ? `FFmpeg: ${result.ffmpeg.version}`
+        : `FFmpeg unavailable: ${result.ffmpeg.error}`;
+      const whisperLine = result.whisper
+        ? result.whisper.configured
+          ? "Whisper: ready"
+          : "Whisper: model missing"
+        : "Whisper: unknown";
+      setApiMessage(`${ffmpegLine} · ${whisperLine}`);
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Video engine check failed");
     } finally {
       setLoading((prev) => ({ ...prev, checkVideoEngine: false }));
+    }
+  };
+
+  const loadTimelineAssets = async (targetPath: string) => {
+    setLoading((prev) => ({ ...prev, timelineAssets: true }));
+    try {
+      const [thumbsResult, waveResult] = await Promise.all([
+        api<{ ok: boolean; thumbnails: { thumbs: TimelineThumb[]; duration: number } }>("/api/video/thumbnails", {
+          method: "POST",
+          body: JSON.stringify({ sourcePath: targetPath, count: 120 }),
+        }).catch(() => null),
+        api<{ ok: boolean; waveform: TimelineWaveform }>("/api/video/waveform", {
+          method: "POST",
+          body: JSON.stringify({ sourcePath: targetPath, width: 1600, height: 88 }),
+        }).catch(() => null),
+      ]);
+      if (thumbsResult?.thumbnails) {
+        setTimelineThumbs(thumbsResult.thumbnails.thumbs);
+        if (thumbsResult.thumbnails.duration) setTimelineDuration(thumbsResult.thumbnails.duration);
+      }
+      if (waveResult?.waveform) setTimelineWave(waveResult.waveform);
+    } finally {
+      setLoading((prev) => ({ ...prev, timelineAssets: false }));
     }
   };
 
@@ -878,13 +986,21 @@ function App() {
     }
     setLoading((prev) => ({ ...prev, probeVideo: true }));
     try {
-      const result = await api<{ ok: boolean; probe: { format?: { duration?: string }; streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number }> } }>("/api/video/probe", {
+      const result = await api<{ ok: boolean; probe: { format?: { duration?: string }; streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number; r_frame_rate?: string }> } }>("/api/video/probe", {
         method: "POST",
         body: JSON.stringify({ sourcePath: targetPath }),
       });
       const video = result.probe.streams?.find((stream) => stream.codec_type === "video");
       const duration = Number(result.probe.format?.duration ?? 0);
+      if (duration) setTimelineDuration(duration);
+      // r_frame_rate is "30000/1001" or "30/1" — parse to a float.
+      const rateRaw = video?.r_frame_rate ?? "30/1";
+      const [num, den] = rateRaw.split("/").map(Number);
+      const parsedFps = num && den ? num / den : 30;
+      setTimelineFps(Number.isFinite(parsedFps) && parsedFps > 0 ? parsedFps : 30);
       setApiMessage(`Source ready: ${video?.width ?? "?"}x${video?.height ?? "?"}, ${duration ? `${Math.round(duration)}s` : "duration unknown"}`);
+      // Fire-and-forget timeline asset generation so the scrubber lights up.
+      void loadTimelineAssets(targetPath);
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Video probe failed");
     } finally {
@@ -912,9 +1028,13 @@ function App() {
       setApiMessage("Add a local source video path before rendering");
       return;
     }
+    if (aspectSelection.length === 0) {
+      setApiMessage("Pick at least one aspect ratio before rendering");
+      return;
+    }
     setRenderingClipId(clip.id);
     try {
-      const result = await api<{ ok: boolean; job: RenderJob }>("/api/clips/render", {
+      const result = await api<{ ok: boolean; jobs: RenderJob[] }>("/api/clips/render", {
         method: "POST",
         body: JSON.stringify({
           sourcePath: clipSourcePath,
@@ -925,19 +1045,90 @@ function App() {
           endTime: clip.endTime,
           mode: renderMode,
           cropMode,
+          aspects: aspectSelection,
           watermarkText,
           headlineText,
           captionText,
+          accentText,
+          transcriptCues,
           gpuAcceleration,
         }),
       });
-      setRenderJobs([result.job, ...renderJobs].slice(0, 12));
-      setApiMessage(`Rendered ${clip.preset}: ${result.job.publicUrl}`);
+      setRenderJobs([...result.jobs, ...renderJobs].slice(0, 24));
+      const aspectCount = result.jobs.length;
+      setApiMessage(`Rendered ${clip.preset} in ${aspectCount} aspect${aspectCount === 1 ? "" : "s"}`);
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Clip render failed");
     } finally {
       setRenderingClipId("");
     }
+  };
+
+  const scanForMoments = async () => {
+    if (!clipSourcePath.trim()) {
+      setApiMessage("Add a source video path before scanning");
+      return;
+    }
+    setLoading((prev) => ({ ...prev, scan: true }));
+    try {
+      const result = await api<{ ok: boolean; scan: ScanResult }>("/api/video/scan", {
+        method: "POST",
+        body: JSON.stringify({ sourcePath: clipSourcePath }),
+      });
+      setScanResult(result.scan);
+      setApiMessage(
+        `Scan: ${result.scan.scenes.length} cuts · ${result.scan.peaks.length} loud windows · ${result.scan.suggestions.length} suggestions`,
+      );
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "Scan failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, scan: false }));
+    }
+  };
+
+  const transcribeClip = async (clip: ClipPlan) => {
+    if (!clipSourcePath.trim()) {
+      setApiMessage("Add a source video path before transcribing");
+      return;
+    }
+    setLoading((prev) => ({ ...prev, transcribe: true }));
+    try {
+      const result = await api<{
+        ok: boolean;
+        transcript: { cues: TranscriptCue[]; modelPath: string };
+      }>("/api/video/transcribe", {
+        method: "POST",
+        body: JSON.stringify({
+          sourcePath: clipSourcePath,
+          startTime: clip.startTime,
+          endTime: clip.endTime,
+          title: clip.title,
+        }),
+      });
+      setTranscriptCues(result.transcript.cues);
+      setApiMessage(`Whisper produced ${result.transcript.cues.length} cue${result.transcript.cues.length === 1 ? "" : "s"}`);
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "Transcription failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, transcribe: false }));
+    }
+  };
+
+  const applySuggestion = (suggestion: ClipSuggestion) => {
+    if (!selectedClip) return;
+    setClipPlans((prev) =>
+      prev.map((c) =>
+        c.id === selectedClip.id
+          ? {
+              ...c,
+              startTime: suggestion.start,
+              endTime: suggestion.end,
+              duration: suggestion.duration,
+            }
+          : c,
+      ),
+    );
+    setApiMessage(`Applied auto-suggestion (${suggestion.type}, score ${suggestion.score.toFixed(2)})`);
   };
 
   const mergeClips = async () => {
@@ -1295,8 +1486,9 @@ function App() {
   const sendTelegramPreview = async () => {
     setLoading((prev) => ({ ...prev, sendTelegramPreview: true }));
     try {
-      const fullText = content.bettingAngle && !content.bettingAngle.startsWith("Market context pending")
-        ? `${content.telegram}\n\n---\nMarket Context\n${content.bettingAngle}`
+      const marketCtx = content.marketContext || content.bettingAngle;
+      const fullText = marketCtx && !marketCtx.startsWith("Market context pending")
+        ? `${content.telegram}\n\n---\nMarket Context\n${marketCtx}`
         : content.telegram;
 
       await api("/api/telegram/preview", {
@@ -1350,23 +1542,69 @@ function App() {
     }
   };
 
-  const sendTelegramBetting = async () => {
-    setLoading((prev) => ({ ...prev, sendTelegramBetting: true }));
+  const sendTelegramMarketContext = async () => {
+    setLoading((prev) => ({ ...prev, sendTelegramMarketContext: true }));
     try {
-      if (!content.bettingAngle || content.bettingAngle.startsWith("Market context pending")) {
+      const marketCtx = content.marketContext || content.bettingAngle;
+      if (!marketCtx || marketCtx.startsWith("Market context pending")) {
         setApiMessage("No valid market context available to send");
         return;
       }
-      const fullText = `${selectedFixture.teamA} vs ${selectedFixture.teamB}\nMarket Context:\n\n${content.bettingAngle}`;
-      await api("/api/telegram/betting", {
+      const fullText = `${selectedFixture.teamA} vs ${selectedFixture.teamB}\nMarket Context:\n\n${marketCtx}`;
+      await api("/api/telegram/market-context", {
         method: "POST",
-        body: JSON.stringify({ text: fullText }),
+        body: JSON.stringify({ text: fullText, target: "admin" }),
       });
-      setApiMessage("Sent Telegram market context post");
+      setApiMessage("Sent Telegram market context to admin inbox");
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Telegram market context post failed");
     } finally {
-      setLoading((prev) => ({ ...prev, sendTelegramBetting: false }));
+      setLoading((prev) => ({ ...prev, sendTelegramMarketContext: false }));
+    }
+  };
+
+  // VIP picks lifecycle. Preview computes EV/Kelly server-side; publish gates on
+  // VIP_JURISDICTIONS + TELEGRAM_BETTING_CHANNEL_ID + VIP_PUBLISH_ENABLED.
+  const [vipPicks, setVipPicks] = useState<Pick[]>([]);
+  const [vipMessage, setVipMessage] = useState<string>("");
+  const [vipPublishEnabled, setVipPublishEnabled] = useState<boolean>(false);
+  const [vipJurisdictions, setVipJurisdictions] = useState<string[]>([]);
+
+  const previewVipPicks = async (fixtureForPreview = selectedFixture) => {
+    setLoading((prev) => ({ ...prev, previewVipPicks: true }));
+    try {
+      const result = await api<VipPreviewResponse>("/api/telegram/vip/preview", {
+        method: "POST",
+        body: JSON.stringify({ fixture: fixtureForPreview, teamRatings: ratings }),
+      });
+      setVipPicks(result.picks ?? []);
+      setVipMessage(result.message ?? "");
+      setVipPublishEnabled(Boolean(result.vipPublishEnabled));
+      setVipJurisdictions(result.jurisdictions ?? []);
+      setApiMessage(result.picks?.length ? `${result.picks.length} value pick(s) found` : "No value picks at current prices");
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "VIP preview failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, previewVipPicks: false }));
+    }
+  };
+
+  const sendTelegramVip = async () => {
+    setLoading((prev) => ({ ...prev, sendTelegramVip: true }));
+    try {
+      const result = await api<VipPublishResponse>("/api/telegram/vip", {
+        method: "POST",
+        body: JSON.stringify({ fixture: selectedFixture, teamRatings: ratings }),
+      });
+      if (result.published) {
+        setApiMessage(`Published ${result.pickCount ?? 0} VIP pick(s)${result.audit?.logged ? " · audit logged" : ""}`);
+      } else {
+        setApiMessage(result.reason || "Nothing was published");
+      }
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "VIP publish failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, sendTelegramVip: false }));
     }
   };
 
@@ -1560,56 +1798,47 @@ function App() {
     { view: "video" as View, title: "Video clipping", icon: <Scissors size={20} /> },
     { view: "automation" as View, title: "Automation", icon: <Activity size={20} /> },
     { view: "review" as View, title: "Review", icon: <ShieldCheck size={20} /> },
+    { view: "vip" as View, title: "VIP desk", icon: <Hash size={20} /> },
   ];
 
   return (
-    <main className={`flex flex-col md:flex-row min-h-screen font-sans selection:bg-signal-gold/30 selection:text-ink relative ${theme === "dark" ? "dark bg-[#101b17] text-[#f6efe0]" : "bg-[#ded6c4] text-[#17211e]"}`}>
-      {/* Sidebar for Desktop */}
-      <aside className="hidden md:flex flex-col gap-6 py-6 px-4 bg-[#0c1512]/95 border-r border-[#d0b36a]/20 sticky top-0 h-screen z-[100] w-64 flex-shrink-0" aria-label="Match Signal navigation">
-        <div className="flex items-center gap-3 border border-[#c9972d]/35 bg-[#c9972d] text-[#101b17] rounded-none font-black text-lg h-12 px-4 font-display tracking-tight select-none">
-          <span>MS</span>
-          <span className="text-xs uppercase tracking-[0.2em] font-extrabold text-[#101b17]/70">Signal OS</span>
-        </div>
-        
-        <div className="flex flex-col gap-1.5 w-full">
-          {navigationTabs.map((tab) => (
-            <div key={tab.view} className="relative w-full h-10 flex items-center">
-              {activeView === tab.view && (
-                <motion.div
-                  layoutId="activeRail"
-                  className="absolute inset-0 bg-[#f6efe0]"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                />
-              )}
-              <button
-                title={tab.title}
-                onClick={() => setActiveView(tab.view)}
-                className={`relative z-10 flex items-center gap-3 px-3 h-10 w-full rounded-none transition-colors duration-300 cursor-pointer ${
-                  activeView === tab.view ? "text-[#101b17] font-bold" : "text-[#a9b1aa] hover:text-[#f6efe0]"
-                }`}
-              >
-                <span className="flex-shrink-0">{tab.icon}</span>
-                <span className="text-[10px] uppercase tracking-wider font-extrabold truncate">{tab.title.split(" ")[0]}</span>
-              </button>
-            </div>
-          ))}
-        </div>
+    <main className="app-shell font-sans selection:bg-[var(--gold-soft)] selection:text-ink relative" style={{ color: "var(--ink)" }}>
+      {/* ===== Editorial rail ===== */}
+      <aside className="rail hidden md:flex" aria-label="Match Signal navigation">
+        <div className="mark" aria-label="The Match Signal OS">MS</div>
+        {navigationTabs.map((tab) => (
+          <button
+            key={tab.view}
+            title={tab.title}
+            aria-current={activeView === tab.view ? "page" : undefined}
+            onClick={() => setActiveView(tab.view)}
+            className={`rail-button ${activeView === tab.view ? "active" : ""}`}
+          >
+            {React.cloneElement(tab.icon as React.ReactElement<any>, { size: 18 })}
+          </button>
+        ))}
       </aside>
 
-      {/* Bottom Navigation for Mobile */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-[#0a0f1e]/90 backdrop-blur-md border-t border-line-border/30 z-[120] flex justify-around items-center px-2 " aria-label="Mobile Navigation">
+      {/* ===== Mobile rail (top, ruled) ===== */}
+      <nav
+        className="md:hidden fixed top-0 left-0 right-0 h-14 bg-[var(--paper)] border-b border-[var(--rule)] z-[120] flex justify-around items-center px-2"
+        aria-label="Mobile navigation"
+      >
         {navigationTabs.map((tab) => {
           const isActive = activeView === tab.view;
           return (
             <button
               key={tab.view}
               onClick={() => setActiveView(tab.view)}
-              className={`flex flex-col items-center justify-center gap-0.5 px-2 py-1 rounded-none transition-colors relative cursor-pointer ${
-                isActive ? "text-pitch-green font-bold" : "text-muted-text"
-              }`}
+              className="flex flex-col items-center justify-center gap-0.5 px-2 py-1 transition-colors relative cursor-pointer"
+              style={{
+                color: isActive ? "var(--ink)" : "var(--ink-quiet)",
+                borderBottom: isActive ? "2px solid var(--ink)" : "2px solid transparent",
+                fontWeight: isActive ? 600 : 500,
+              }}
             >
-              {React.cloneElement(tab.icon as React.ReactElement<any>, { size: 18 })}
-              <span className="text-[9px] uppercase tracking-wider font-semibold font-mono truncate max-w-[55px]">
+              {React.cloneElement(tab.icon as React.ReactElement<any>, { size: 16 })}
+              <span className="text-[9px] uppercase tracking-[0.08em] truncate max-w-[55px]">
                 {tab.title.split(" ")[0]}
               </span>
             </button>
@@ -1617,78 +1846,67 @@ function App() {
         })}
       </nav>
 
-      <section className="flex-1 max-w-[1650px] w-full p-4 md:p-8 pb-24 md:pb-8 overflow-x-hidden flex flex-col gap-6">
-        <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-[#d0b36a]/25 pb-5 mb-2">
-          <div>
-            <p className="text-signal-gold text-[10px] font-extrabold uppercase tracking-[0.24em] mb-1">
-              Anonymous football intelligence
-            </p>
-            <h1 className="text-[#17211e] dark:text-[#f6efe0] text-3xl font-black tracking-[-0.04em]">The Match Signal OS</h1>
+      <section className="workspace pt-16 md:pt-0 pb-24 md:pb-10 overflow-x-hidden flex flex-col gap-7">
+        {/* ===== Editorial masthead ===== */}
+        <header className="topbar">
+          <div className="flex flex-col gap-2">
+            <p className="eyebrow gold">Anonymous football intelligence · World Cup 2026</p>
+            <h1>The Match Signal OS</h1>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-none border border-line-border/40 bg-paper-2 text-xs font-semibold text-slate-700 dark:text-ink font-mono">
-              <Activity size={14} className="text-pitch-green" /> {todayCount} active
+          <div className="operator-strip">
+            <span>
+              <Activity size={12} style={{ color: "var(--pitch)" }} />
+              <b>{todayCount}</b> active
             </span>
-            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-none border border-line-border/40 bg-paper-2 text-xs font-semibold text-slate-700 dark:text-ink font-mono">
-              <CheckCircle2 size={14} className="text-pitch-green" /> {approvedCount} approved
+            <span>
+              <CheckCircle2 size={12} style={{ color: "var(--pitch)" }} />
+              <b>{approvedCount}</b> approved
             </span>
-            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-none border border-line-border/40 bg-paper-2 text-xs font-semibold text-slate-700 dark:text-ink font-mono">
-              <BarChart3 size={14} className="text-pitch-green" /> {providerCount}/{providerTotal} APIs
+            <span>
+              <BarChart3 size={12} style={{ color: "var(--pitch)" }} />
+              <b>{providerCount}/{providerTotal}</b> APIs
             </span>
-            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-none border border-line-border/40 bg-paper-2 text-xs font-semibold text-slate-700 dark:text-ink font-mono">
-              <ShieldCheck size={14} className="text-pitch-green" /> {stateSource}
+            <span>
+              <ShieldCheck size={12} style={{ color: "var(--pitch)" }} />
+              <b>{stateSource}</b>
             </span>
-            <Button
-              variant="glass"
-              icon={theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
-              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              className="h-8 w-8 p-0"
-              title="Toggle theme"
-            />
-            <Button
-              variant="primary"
-              icon={<Download size={14} />}
-              onClick={downloadReport}
-              className="h-8 text-xs text-[#060913]"
-            >
+            <Button variant="primary" icon={<Download size={13} />} onClick={downloadReport}>
               Export report
             </Button>
           </div>
         </header>
 
+        {/* ===== Command-center byline (only on command view) ===== */}
         {activeView === "command" && (
-          <section className="grid grid-cols-1 gap-3 border border-[#d0b36a]/25 bg-[#101b17] p-4 text-[#f6efe0] md:grid-cols-4">
+          <section className="grid grid-cols-2 md:grid-cols-4 border-y border-[var(--rule)]">
             {[
               ["Desk", `${fixtures.length} fixtures`],
               ["Signal", `${selectedFixture.teamA} vs ${selectedFixture.teamB}`],
               ["Publishing", `${approvedCount} approved`],
               ["Connectors", `${providerCount}/${providerTotal} ready`],
             ].map(([label, value]) => (
-              <div key={label} className="border-l border-[#c9972d]/45 pl-4">
-                <span className="block text-[10px] font-black uppercase tracking-[0.22em] text-[#c9972d]">{label}</span>
-                <strong className="mt-1 block truncate text-sm font-black">{value}</strong>
+              <div
+                key={label}
+                className="flex flex-col gap-1.5 py-5 pr-6 border-r last:border-r-0 border-[var(--rule)]"
+              >
+                <span className="caption">{label}</span>
+                <strong className="figure text-[clamp(1.2rem,1.8vw,1.6rem)] text-ink leading-tight truncate">
+                  {value}
+                </strong>
               </div>
             ))}
           </section>
         )}
 
-        <nav className="flex flex-wrap gap-2 bg-paper-2 border border-line-border/30 rounded-none p-1.5 w-max max-w-full select-none" aria-label="Workspace views">
+        {/* ===== View tabs (ruled segmented) ===== */}
+        <nav className="view-tabs" aria-label="Workspace views">
           {navigationTabs.map((tab) => (
             <button
               key={tab.view}
-              className={`relative px-4 py-2 text-xs font-bold uppercase rounded-none transition-colors duration-300 flex items-center gap-2 cursor-pointer ${
-                activeView === tab.view ? "text-[#060913]" : "text-muted-text hover:text-ink"
-              }`}
+              className={activeView === tab.view ? "active" : ""}
               onClick={() => setActiveView(tab.view)}
             >
-              {activeView === tab.view && (
-                <motion.div
-                  layoutId="activeTabPill"
-                  className="absolute inset-0 bg-[#c9972d] rounded-none shadow-sm"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                />
-              )}
-              <span className="relative z-10 flex items-center gap-1.5">
+              <span className="inline-flex items-center gap-2">
                 {React.cloneElement(tab.icon as React.ReactElement<any>, { size: 14 })}
                 {tab.title}
               </span>
@@ -1697,107 +1915,104 @@ function App() {
         </nav>
 
         {activeView === "automation" && (
-          <section className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <article className="border border-[#d0b36a]/25 bg-[#101b17] p-6 md:p-8 text-[#f6efe0] xl:col-span-2">
-              <div className="grid gap-6 lg:grid-cols-[1fr_420px] lg:items-end">
-                <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.28em] text-[#c9972d]">Social Ops Control</p>
-                  <h2 className="mt-4 text-[clamp(2rem,4.4vw,4.6rem)] font-black leading-[0.92] tracking-[-0.055em]">
-                    Connect, draft, approve, publish.
-                  </h2>
-                  <p className="mt-5 max-w-[720px] text-base leading-7 text-[#d9d0bd]">{apiMessage}</p>
-                </div>
-                <div className="grid grid-cols-2 border border-[#f6efe0]/10 bg-[#f6efe0]/5">
-                  {[
-                    ["Providers", `${providerCount}/${providerTotal}`],
-                    ["Approved", String(approvedCount)],
-                    ["Source", stateSource],
-                    ["Drafts", String(queueBreakdown.draft)],
-                  ].map(([label, value]) => (
-                    <div key={label} className="border-b border-r border-[#f6efe0]/10 p-4 odd:border-r">
-                      <span className="block text-[10px] font-black uppercase tracking-[0.18em] text-[#c9972d]">{label}</span>
-                      <strong className="mt-2 block font-mono text-lg font-black">{value}</strong>
-                    </div>
-                  ))}
-                </div>
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-12 gap-y-6">
+              <div>
+                <p className="eyebrow gold">Social Ops Control</p>
+                <h1 className="mt-3 text-ink">Connect, draft, approve, publish.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">{apiMessage}</p>
+                <div className="hr-gold mt-4" />
               </div>
-            </article>
+              <div className="self-end grid grid-cols-2 border-t border-[var(--rule)]">
+                {[
+                  ["Providers", `${providerCount}/${providerTotal}`],
+                  ["Approved", String(approvedCount)],
+                  ["Source", stateSource],
+                  ["Drafts", String(queueBreakdown.draft)],
+                ].map(([label, value]) => (
+                  <div key={label} className="flex flex-col gap-1.5 py-4 pr-5 border-r last:border-r-0 odd:border-r border-[var(--rule)] border-b odd:[&:nth-last-child(-n+2)]:border-b-0 even:[&:nth-last-child(-n+2)]:border-b-0">
+                    <span className="caption">{label}</span>
+                    <strong className="figure text-[clamp(1.2rem,1.8vw,1.6rem)] text-ink leading-none truncate">{value}</strong>
+                  </div>
+                ))}
+              </div>
+            </header>
 
-            <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-              <div className="flex flex-col gap-4 border-b border-line-border/35 pb-4 md:flex-row md:items-start md:justify-between">
+            {/* Provider matrix */}
+            <section>
+              <div className="flex flex-wrap items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                 <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Provider Matrix</p>
-                  <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Connections</h2>
+                  <p className="eyebrow pitch">Provider Matrix</p>
+                  <h2 className="mt-1 text-ink">Connections</h2>
                 </div>
-                <Button variant="primary" icon={<Activity size={15} />} onClick={checkHealth} loading={loading.checkHealth}>
+                <Button variant="primary" icon={<Activity size={14} />} onClick={checkHealth} loading={loading.checkHealth}>
                   Check APIs
                 </Button>
               </div>
-              <div className="mt-5 grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+              <div className="mt-5 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-x-6 gap-y-3">
                 {providerBadges.map((badge) => {
                   const ready = providerReady(health, badge);
                   return (
                     <div
-                      className={`flex items-center justify-between border p-3 ${
-                        ready ? "border-pitch-green/30 bg-pitch-green/10" : "border-pressure-red/30 bg-pressure-red/10"
-                      }`}
                       key={badge.key}
+                      className="flex items-baseline justify-between gap-3 py-3 border-b border-[var(--rule)]"
                     >
-                      <span className="text-sm font-black text-ink">{badge.label}</span>
-                      <span className={`font-mono text-[10px] font-black uppercase tracking-[0.12em] ${ready ? "text-pitch-green" : "text-pressure-red"}`}>
+                      <span className="text-[0.9rem] text-ink font-medium">{badge.label}</span>
+                      <span
+                        className="caption"
+                        style={{ color: ready ? "var(--pitch)" : "var(--ink-quiet)" }}
+                      >
                         {ready ? "ready" : "missing"}
                       </span>
                     </div>
                   );
                 })}
               </div>
-            </article>
+            </section>
 
-            <aside className="grid gap-5">
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Publish Stack</p>
-                <div className="mt-5 grid gap-3">
-                  <Button variant="primary" icon={<Send size={15} />} onClick={socialDryRun} loading={loading.socialDryRun}>Buffer draft</Button>
-                  <Button variant="glass" icon={<Radio size={15} />} onClick={sendTelegramPreview} loading={loading.sendTelegramPreview}>Telegram preview</Button>
-                  <Button variant="glass" icon={<Send size={15} />} onClick={sendTelegramPublic} loading={loading.sendTelegramPublic}>Telegram public</Button>
-                  <Button variant="glass" icon={<BarChart3 size={15} />} onClick={sendTelegramBetting} loading={loading.sendTelegramBetting}>Market context</Button>
-                  <Button variant="glass" icon={<Sparkles size={15} />} onClick={triggerN8n} loading={loading.triggerN8n}>Trigger n8n</Button>
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-x-12 gap-y-10">
+              <article>
+                <div className="pb-3 border-b border-[var(--rule-strong)]">
+                  <p className="eyebrow pitch">Publish stack</p>
+                  <h2 className="mt-1 text-ink">Channels &amp; previews</h2>
+                </div>
+                <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <Button variant="primary" icon={<Send size={14} />} onClick={socialDryRun} loading={loading.socialDryRun}>Buffer draft</Button>
+                  <Button variant="secondary" icon={<Radio size={14} />} onClick={sendTelegramPreview} loading={loading.sendTelegramPreview}>Telegram preview</Button>
+                  <Button variant="secondary" icon={<Send size={14} />} onClick={sendTelegramPublic} loading={loading.sendTelegramPublic}>Telegram public</Button>
+                  <Button variant="secondary" icon={<BarChart3 size={14} />} onClick={sendTelegramMarketContext} loading={loading.sendTelegramMarketContext}>Market context</Button>
+                  <Button variant="secondary" icon={<Sparkles size={14} />} onClick={triggerN8n} loading={loading.triggerN8n}>Trigger n8n</Button>
                 </div>
               </article>
 
-              <article className="border border-line-border/45 bg-[#101b17] p-5 text-[#f6efe0]">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-[#c9972d]">Render JSON</p>
-                <pre className="mt-4 max-h-[360px] overflow-auto border border-[#f6efe0]/10 bg-[#0c1713] p-4 text-[11px] leading-5 text-[#f6efe0]">{JSON.stringify(videoJson, null, 2)}</pre>
-                <Button variant="glass" icon={<Clipboard size={14} />} onClick={() => copy("Video JSON", JSON.stringify(videoJson, null, 2))} className="mt-4 w-full text-xs">
-                  {copied === "Video JSON" ? "Copied" : "Copy JSON"}
-                </Button>
+              <article>
+                <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                  <div>
+                    <p className="eyebrow pitch">Data feeds</p>
+                    <h2 className="mt-1 text-ink">Source sync</h2>
+                  </div>
+                </div>
+                <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+                  <Button onClick={importFixtures} loading={loading.importFixtures}>Football-data</Button>
+                  <Button onClick={syncWorldCupSources} loading={loading.syncWorldCup}>Dual-source</Button>
+                  <Button onClick={importSportradarDay} loading={loading.importSportradarDay}>SR day enrich</Button>
+                  <Button onClick={fetchSportradarStandings} loading={loading.standings}>SR standings</Button>
+                  <Button onClick={fetchSportradarSummary} loading={loading.fetchSportradarSummary}>SR summary</Button>
+                  <Button onClick={fetchSportradarLineups} loading={loading.fetchSportradarLineups}>SR lineups</Button>
+                  <Button onClick={fetchSportradarTimeline} loading={loading.fetchSportradarTimeline}>SR timeline</Button>
+                  <Button onClick={fetchSportradarMomentum} loading={loading.fetchSportradarMomentum}>SR momentum</Button>
+                  <Button onClick={fetchSportradarLive} loading={loading.fetchSportradarLive}>SR live</Button>
+                </div>
               </article>
-            </aside>
+            </section>
 
-            <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-              <div className="border-b border-line-border/35 pb-4">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Data Feeds</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Source Sync</h2>
+            <section>
+              <div className="pb-3 border-b border-[var(--rule-strong)]">
+                <p className="eyebrow pitch">Storage &amp; export</p>
+                <h2 className="mt-1 text-ink">State control</h2>
               </div>
-              <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                <Button onClick={importFixtures} loading={loading.importFixtures}>Football-data</Button>
-                <Button onClick={syncWorldCupSources} loading={loading.syncWorldCup}>Dual-source</Button>
-                <Button onClick={importSportradarDay} loading={loading.importSportradarDay}>SR day enrich</Button>
-                <Button onClick={fetchSportradarStandings} loading={loading.standings}>SR standings</Button>
-                <Button onClick={fetchSportradarSummary} loading={loading.fetchSportradarSummary}>SR summary</Button>
-                <Button onClick={fetchSportradarLineups} loading={loading.fetchSportradarLineups}>SR lineups</Button>
-                <Button onClick={fetchSportradarTimeline} loading={loading.fetchSportradarTimeline}>SR timeline</Button>
-                <Button onClick={fetchSportradarMomentum} loading={loading.fetchSportradarMomentum}>SR momentum</Button>
-                <Button onClick={fetchSportradarLive} loading={loading.fetchSportradarLive}>SR live</Button>
-              </div>
-            </article>
-
-            <article className="border border-line-border/45 bg-paper p-5 md:p-6 xl:col-span-2">
-              <div className="border-b border-line-border/35 pb-4">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Storage & Export</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">State Control</h2>
-              </div>
-              <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                 <Button onClick={setupTelegram} loading={loading.setupTelegram}>Telegram setup</Button>
                 <Button onClick={checkTelegramStatus} loading={loading.checkTelegramStatus}>Telegram status</Button>
                 <Button onClick={pushSupabase} loading={loading.pushSupabase}>Push Supabase</Button>
@@ -1808,27 +2023,41 @@ function App() {
                 <Button onClick={saveServerState} loading={loading.saveServerState}>Save backend</Button>
                 <Button onClick={loadServerState} loading={loading.loadServerState}>Load backend</Button>
               </div>
-            </article>
+            </section>
+
+            <section>
+              <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow pitch">Remotion video engine</p>
+                  <h2 className="mt-1 text-ink">Render JSON</h2>
+                </div>
+                <Button variant="ghost" icon={<Clipboard size={13} />} onClick={() => copy("Video JSON", JSON.stringify(videoJson, null, 2))}>
+                  {copied === "Video JSON" ? "Copied" : "Copy JSON"}
+                </Button>
+              </div>
+              <pre className="mt-4 max-h-[360px]">{JSON.stringify(videoJson, null, 2)}</pre>
+            </section>
           </section>
         )}
 
         {activeView === "command" && (
-          <section className="grid grid-cols-1 gap-5 xl:grid-cols-[360px_minmax(0,1fr)] xl:items-start">
-            <aside className="border border-line-border/45 bg-paper p-5 xl:sticky xl:top-6 xl:max-h-[calc(100dvh-48px)] xl:overflow-y-auto">
-              <div className="flex items-start justify-between gap-3 border-b border-line-border/35 pb-4">
+          <section className="grid grid-cols-1 gap-12 xl:grid-cols-[320px_minmax(0,1fr)] xl:items-start">
+            {/* Fixture queue */}
+            <aside className="xl:sticky xl:top-6 xl:max-h-[calc(100dvh-48px)] xl:overflow-y-auto xl:pr-5 xl:border-r xl:border-[var(--rule)]">
+              <div className="flex items-start justify-between gap-3 pb-4 border-b border-[var(--rule-strong)]">
                 <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Match Queue</p>
-                  <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Fixture Desk</h2>
-                  <p className="mt-2 text-xs leading-5 text-muted-text">
+                  <p className="eyebrow gold">Match Queue</p>
+                  <h2 className="mt-2 text-ink">Fixture Desk</h2>
+                  <p className="mt-2 text-sm text-[var(--ink-muted)] max-w-[36ch]">
                     Ranked by match interest, content status, and operator readiness.
                   </p>
                 </div>
                 <Button variant="icon" onClick={addFixture} title="Add fixture" aria-label="Add fixture">
-                  <CalendarPlus size={18} />
+                  <CalendarPlus size={16} />
                 </Button>
               </div>
 
-              <div className="mt-4 grid grid-cols-4 border border-line-border/35 bg-field-bg/35 text-center">
+              <div className="mt-5 grid grid-cols-4 border-b border-[var(--rule)]">
                 {[
                   ["Draft", queueBreakdown.draft],
                   ["Approved", queueBreakdown.approved],
@@ -1836,50 +2065,54 @@ function App() {
                   ["Live", queueBreakdown.live],
                 ].map(([label, value]) => (
                   <button
-                    key={label}
+                    key={label as string}
                     type="button"
                     onClick={() => setQueueFilter(label as ContentStatus | FixtureStatus)}
-                    className={`min-h-0 justify-center rounded-none border-0 border-r border-line-border/30 bg-transparent px-2 py-2 last:border-r-0 ${
-                      queueFilter === label ? "text-signal-gold" : "text-muted-text hover:text-ink"
-                    }`}
+                    className="min-h-0 flex flex-col gap-1 py-3 px-1 border-0 border-r border-[var(--rule)] last:border-r-0 bg-transparent text-left items-start"
+                    style={{
+                      color: queueFilter === label ? "var(--ink)" : "var(--ink-quiet)",
+                    }}
                   >
-                    <span className="grid gap-0.5">
-                      <strong className="font-mono text-sm text-ink">{value}</strong>
-                      <span className="text-[9px] font-black uppercase tracking-[0.12em]">{label}</span>
-                    </span>
+                    <strong className="figure text-[1.4rem] leading-none text-ink">{value}</strong>
+                    <span className="caption">{label as string}</span>
                   </button>
                 ))}
               </div>
 
-              <div className="mt-4 flex items-center gap-2 border border-line-border/45 bg-field-bg px-3 py-2">
-                <Search size={15} className="shrink-0 text-signal-gold" />
+              <div className="mt-5 flex items-center gap-2 border-b border-[var(--rule-strong)] py-1.5">
+                <Search size={14} className="shrink-0 text-[var(--ink-quiet)]" />
                 <input
                   value={queueSearch}
                   onChange={(event) => setQueueSearch(event.target.value)}
                   placeholder="Search team, venue, stage"
-                  className="min-h-0 w-full border-0 bg-transparent p-0 text-sm font-bold text-ink outline-none placeholder:text-muted-text"
+                  className="min-h-0 w-full border-0 bg-transparent p-0 text-sm text-ink outline-none placeholder:text-[var(--ink-quiet)]"
+                  style={{ borderBottom: "none" }}
                 />
               </div>
 
-              <div className="mt-3 flex flex-wrap gap-2">
-                {(["All", "Draft", "Approved", "Posted", "Scheduled", "Live"] as Array<"All" | ContentStatus | FixtureStatus>).map((filter) => (
-                  <button
-                    key={filter}
-                    type="button"
-                    onClick={() => setQueueFilter(filter)}
-                    className={`min-h-0 rounded-none px-3 py-1.5 text-[10px] font-black uppercase tracking-[0.12em] ${
-                      queueFilter === filter
-                        ? "border-signal-gold bg-signal-gold text-[#101b17]"
-                        : "border-line-border/45 bg-transparent text-muted-text hover:text-ink"
-                    }`}
-                  >
-                    {filter}
-                  </button>
-                ))}
+              <div className="mt-4 flex flex-wrap gap-1.5">
+                {(["All", "Draft", "Approved", "Posted", "Scheduled", "Live"] as Array<"All" | ContentStatus | FixtureStatus>).map((filter) => {
+                  const isOn = queueFilter === filter;
+                  return (
+                    <button
+                      key={filter}
+                      type="button"
+                      onClick={() => setQueueFilter(filter)}
+                      className="min-h-0 px-2 py-1 text-[0.7rem] uppercase tracking-[0.08em] font-semibold border bg-transparent"
+                      style={{
+                        color: isOn ? "var(--paper)" : "var(--ink-muted)",
+                        background: isOn ? "var(--ink)" : "transparent",
+                        borderColor: isOn ? "var(--ink)" : "var(--rule-strong)",
+                      }}
+                    >
+                      {filter}
+                    </button>
+                  );
+                })}
               </div>
 
-              <div className="mt-5 flex items-center justify-between border-y border-line-border/35 py-2">
-                <span className="text-[10px] font-black uppercase tracking-[0.18em] text-muted-text">
+              <div className="mt-5 flex items-baseline justify-between border-b border-[var(--rule)] pb-2">
+                <span className="caption">
                   Showing {filteredQueue.length}/{fixtures.length}
                 </span>
                 <button
@@ -1888,127 +2121,124 @@ function App() {
                     setQueueFilter("All");
                     setQueueSearch("");
                   }}
-                  className="min-h-0 rounded-none border-0 bg-transparent px-0 py-0 text-[10px] font-black uppercase tracking-[0.16em] text-signal-gold hover:bg-transparent"
+                  className="min-h-0 bg-transparent px-0 py-0 text-[0.72rem] font-semibold tracking-[0.04em] text-pitch hover:underline"
                 >
                   Reset
                 </button>
               </div>
 
-              <div className="mt-4 grid gap-2">
+              <div className="mt-2 grid gap-0">
                 {filteredQueue.length ? filteredQueue.map(({ fixture, prediction: fixturePrediction, score, label }, index) => {
                   const isSelected = fixture.id === selectedFixture.id;
                   return (
                     <button
                       key={fixture.id}
-                      className={`group w-full border p-0 text-left transition-colors duration-200 ${
-                        isSelected
-                          ? "border-signal-gold bg-signal-gold/10 text-ink"
-                          : "border-line-border/35 bg-field-bg/50 text-ink hover:border-signal-gold/45"
-                      }`}
+                      className="group w-full text-left transition-colors min-h-0 p-0 border-0"
                       onClick={() => setSelectedId(fixture.id)}
+                      style={{
+                        borderBottom: "1px solid var(--rule)",
+                        borderLeft: isSelected ? "2px solid var(--gold)" : "2px solid transparent",
+                        background: isSelected ? "var(--paper-raised)" : "transparent",
+                        paddingLeft: 12,
+                      }}
                     >
-                      <div className="grid grid-cols-[38px_minmax(0,1fr)_52px] items-stretch">
-                        <div className={`flex items-center justify-center border-r border-line-border/30 font-mono text-[10px] font-black ${
-                          isSelected ? "bg-signal-gold text-[#101b17]" : "text-muted-text"
-                        }`}>
-                          {String(index + 1).padStart(2, "0")}
-                        </div>
-                        <div className="min-w-0 px-3 py-2.5">
-                          <div className="flex min-w-0 items-start justify-between gap-2">
-                            <span className="min-w-0 text-sm font-black leading-tight tracking-[-0.02em]">
-                              {fixture.teamA} <span className="text-signal-gold">vs</span> {fixture.teamB}
-                            </span>
-                          </div>
-                          <div className="mt-2 grid gap-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-muted-text">
-                            <span className="truncate font-mono">{fixture.date} / {fixture.time}</span>
-                            <span className="truncate">{fixture.stage} / {fixture.venue || "Venue TBD"}</span>
-                          </div>
-                          <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                            <span className="border border-line-border/35 px-2 py-1 text-[9px] font-black uppercase tracking-[0.12em] text-muted-text">{fixture.status}</span>
-                            <span className="border border-line-border/35 px-2 py-1 text-[9px] font-black uppercase tracking-[0.12em] text-muted-text">{fixture.contentStatus}</span>
-                            <span className="border border-line-border/35 px-2 py-1 text-[9px] font-black uppercase tracking-[0.12em] text-muted-text">{fixturePrediction.upsetRisk} risk</span>
+                      <div className="grid grid-cols-[28px_minmax(0,1fr)_44px] items-start py-3">
+                        <span className="caption tabular pt-0.5">{String(index + 1).padStart(2, "0")}</span>
+                        <div className="min-w-0">
+                          <span className="block text-[0.95rem] font-medium leading-tight text-ink truncate">
+                            {fixture.teamA}
+                            <span className="text-[var(--ink-quiet)] mx-1.5 italic font-display [font-variation-settings:'opsz'_60]">vs</span>
+                            {fixture.teamB}
+                          </span>
+                          <span className="block tabular text-[0.72rem] text-[var(--ink-quiet)] mt-1">
+                            {fixture.date} · {fixture.time} · {fixture.stage}
+                          </span>
+                          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[0.68rem] uppercase tracking-[0.08em] text-[var(--ink-quiet)]">
+                            <span>{fixture.status}</span>
+                            <span>·</span>
+                            <span>{fixture.contentStatus}</span>
+                            <span>·</span>
+                            <span>{fixturePrediction.upsetRisk} risk</span>
                           </div>
                         </div>
-                        <div className="grid place-items-center border-l border-line-border/30 px-2">
-                          <span className="font-mono text-lg font-black text-signal-gold">{score}</span>
-                          <span className="mt-[-10px] text-[8px] font-black uppercase tracking-[0.1em] text-muted-text">{label}</span>
+                        <div className="grid place-items-end pr-1">
+                          <span className="figure text-[1.5rem] leading-none text-ink">{score}</span>
+                          <span className="caption text-[0.62rem] mt-0.5">{label}</span>
                         </div>
                       </div>
                     </button>
                   );
                 }) : (
-                  <div className="border border-dashed border-line-border/55 bg-field-bg/40 p-5">
-                    <p className="text-sm font-black text-ink">No fixtures match this queue view.</p>
-                    <p className="mt-2 text-xs leading-5 text-muted-text">Clear the search or switch the filter back to All.</p>
-                  </div>
+                  <p className="text-sm text-[var(--ink-muted)] py-6">
+                    No fixtures match this queue view. Clear the search or switch the filter back to All.
+                  </p>
                 )}
               </div>
             </aside>
 
-            <section className="flex min-w-0 flex-col gap-5">
-              <article className="relative overflow-hidden border border-[#d0b36a]/25 bg-[#101b17] p-6 md:p-8 text-[#f6efe0]">
-                <div className="absolute right-[-160px] top-[-200px] h-[460px] w-[460px] rounded-full border-[38px] border-[#c9972d]/20" />
-                <div className="relative">
-                  <p className="text-[10px] font-black uppercase tracking-[0.28em] text-[#c9972d]">Current Signal</p>
-                  <div className="mt-5 grid gap-6">
-                    <div>
-                      <h2 className="max-w-[780px] text-[clamp(2.25rem,4.2vw,4.5rem)] font-black leading-[0.9] tracking-[-0.06em]">
-                        {selectedFixture.teamA}
-                        <span className="block text-[#c9972d]">vs</span>
-                        {selectedFixture.teamB}
-                      </h2>
-                      <p className="mt-6 max-w-[760px] text-base leading-7 text-[#d9d0bd]">{prediction.storyline}</p>
+            {/* Main column */}
+            <section className="flex min-w-0 flex-col gap-12">
+              {/* Editorial signal hero */}
+              <article className="border-t-2 border-ink pt-7">
+                <p className="eyebrow gold">Current Signal · {selectedFixture.stage}</p>
+                <h1 className="mt-3 text-ink max-w-[18ch]">
+                  {selectedFixture.teamA}
+                  <span className="block text-[var(--ink-muted)] italic font-display font-normal text-[0.45em] mt-1 [font-variation-settings:'opsz'_60]">
+                    versus
+                  </span>
+                  {selectedFixture.teamB}
+                </h1>
+                <p className="mt-6 max-w-[60ch] text-[1rem] leading-[1.6] text-[var(--ink-muted)]">
+                  {prediction.storyline}
+                </p>
+                <div className="mt-7 grid grid-cols-1 md:grid-cols-3 border-y border-[var(--rule)]">
+                  {[
+                    ["Lean", prediction.winnerLean],
+                    ["Score", prediction.expectedScore],
+                    ["Confidence", `${prediction.confidence}/10`],
+                  ].map(([k, v]) => (
+                    <div key={k} className="flex flex-col gap-1.5 py-5 pr-6 border-r last:border-r-0 border-[var(--rule)]">
+                      <span className="caption">{k}</span>
+                      <span className="figure text-[clamp(1.4rem,2vw,1.85rem)] text-ink leading-none">{v}</span>
                     </div>
-                    <div className="grid gap-3 border border-[#f6efe0]/10 bg-[#f6efe0]/5 p-4 md:grid-cols-3">
-                      <div className="flex items-center justify-between border-b border-[#f6efe0]/10 pb-3 md:block md:border-b-0 md:border-r md:pb-0 md:pr-4">
-                        <span className="text-xs font-black uppercase tracking-[0.18em] text-[#c9972d]">Lean</span>
-                        <strong className="block text-right text-sm font-black md:mt-2 md:text-left">{prediction.winnerLean}</strong>
-                      </div>
-                      <div className="flex items-center justify-between border-b border-[#f6efe0]/10 pb-3 md:block md:border-b-0 md:border-r md:pb-0 md:pr-4">
-                        <span className="text-xs font-black uppercase tracking-[0.18em] text-[#c9972d]">Score</span>
-                        <strong className="block font-mono text-sm font-black md:mt-2">{prediction.expectedScore}</strong>
-                      </div>
-                      <div className="flex items-center justify-between md:block">
-                        <span className="text-xs font-black uppercase tracking-[0.18em] text-[#c9972d]">Confidence</span>
-                        <strong className="block font-mono text-sm font-black md:mt-2">{prediction.confidence}/10</strong>
-                      </div>
-                    </div>
-                    <div className="grid gap-3 border-t border-[#f6efe0]/10 pt-4 sm:grid-cols-2 xl:grid-cols-4">
-                      <Button variant="primary" icon={<Sparkles size={15} />} onClick={generateWithAI} loading={loading.generateWithAI}>Generate</Button>
-                      <Button variant="glass" icon={<Radio size={15} />} onClick={sendTelegramPreview} loading={loading.sendTelegramPreview}>Telegram</Button>
-                      <Button variant="glass" icon={<Send size={15} />} onClick={socialDryRun} loading={loading.socialDryRun}>Buffer draft</Button>
-                      <Button variant="glass" icon={<ShieldCheck size={15} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Approved" })}>Approve</Button>
-                    </div>
-                  </div>
+                  ))}
+                </div>
+                <div className="mt-6 flex flex-wrap gap-2">
+                  <Button variant="primary" icon={<Sparkles size={14} />} onClick={generateWithAI} loading={loading.generateWithAI}>Generate</Button>
+                  <Button variant="secondary" icon={<Radio size={14} />} onClick={sendTelegramPreview} loading={loading.sendTelegramPreview}>Telegram preview</Button>
+                  <Button variant="secondary" icon={<Send size={14} />} onClick={socialDryRun} loading={loading.socialDryRun}>Buffer draft</Button>
+                  <Button variant="success" icon={<ShieldCheck size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Approved" })}>Approve</Button>
                 </div>
               </article>
 
-              <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-                <Metric label="Interest" value={`${interestLabelFor(selectedInterest)} / ${selectedInterest}`} />
+              {/* Signal meters */}
+              <section className="signal-meters border-y border-[var(--rule)]">
+                <Metric label="Interest" value={`${interestLabelFor(selectedInterest)} · ${selectedInterest}`} />
                 <Metric label="Upset watch" value={prediction.upsetRisk} />
                 <Metric label="Goal potential" value={prediction.goalPotential} />
                 <Metric label="Fan pressure" value={marketContext.fanPressure} />
               </section>
 
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="flex flex-col gap-4 border-b border-line-border/35 pb-4 md:flex-row md:items-start md:justify-between">
+              {/* Fixture metadata editor */}
+              <article>
+                <div className="flex flex-wrap items-end justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                   <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Fixture Control</p>
-                    <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Match Metadata</h2>
+                    <p className="eyebrow pitch">Fixture Control</p>
+                    <h2 className="mt-1 text-ink">Match metadata</h2>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    <Button variant="glass" icon={<BarChart3 size={15} />} onClick={syncOddsApi} loading={loading.syncOddsApi}>Market feed</Button>
-                    <Button variant="primary" icon={<Sparkles size={15} />} onClick={generateWithAI} loading={loading.generateWithAI}>Generate</Button>
+                    <Button variant="secondary" icon={<BarChart3 size={14} />} onClick={syncOddsApi} loading={loading.syncOddsApi}>Market feed</Button>
+                    <Button variant="primary" icon={<Sparkles size={14} />} onClick={generateWithAI} loading={loading.generateWithAI}>Generate</Button>
                   </div>
                 </div>
-                <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-6">
+                <div className="mt-5 grid grid-cols-1 gap-x-8 gap-y-5 md:grid-cols-2 xl:grid-cols-6">
                   <div className="xl:col-span-3"><LabeledInput label="Team A" value={selectedFixture.teamA} onChange={(teamA) => { updateFixture(selectedFixture.id, { teamA }); ensureRating(teamA); }} /></div>
                   <div className="xl:col-span-3"><LabeledInput label="Team B" value={selectedFixture.teamB} onChange={(teamB) => { updateFixture(selectedFixture.id, { teamB }); ensureRating(teamB); }} /></div>
                   <LabeledInput label="Date" type="date" value={selectedFixture.date} onChange={(date) => updateFixture(selectedFixture.id, { date })} />
                   <LabeledInput label="Time" type="time" value={selectedFixture.time} onChange={(time) => updateFixture(selectedFixture.id, { time })} />
                   <div className="xl:col-span-2"><LabeledInput label="Stage" value={selectedFixture.stage} onChange={(stage) => updateFixture(selectedFixture.id, { stage })} /></div>
                   <div className="xl:col-span-2"><LabeledInput label="Venue" value={selectedFixture.venue} onChange={(venue) => updateFixture(selectedFixture.id, { venue })} /></div>
-                  <div className="md:col-span-2 xl:col-span-6 grid grid-cols-1 gap-3 border border-dashed border-line-border/55 bg-field-bg/35 p-4 md:grid-cols-3">
+                  <div className="md:col-span-2 xl:col-span-6 grid grid-cols-1 gap-x-8 gap-y-5 md:grid-cols-3 pt-5 border-t border-[var(--rule)]">
                     <LabeledInput label="Home price context" type="number" value={String(selectedFixture.homeOdds || "")} onChange={(val) => updateFixture(selectedFixture.id, { homeOdds: parseFloat(val) || undefined })} />
                     <LabeledInput label="Draw price context" type="number" value={String(selectedFixture.drawOdds || "")} onChange={(val) => updateFixture(selectedFixture.id, { drawOdds: parseFloat(val) || undefined })} />
                     <LabeledInput label="Away price context" type="number" value={String(selectedFixture.awayOdds || "")} onChange={(val) => updateFixture(selectedFixture.id, { awayOdds: parseFloat(val) || undefined })} />
@@ -2016,7 +2246,8 @@ function App() {
                 </div>
               </article>
 
-              <section className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+              {/* Ratings */}
+              <section className="grid grid-cols-1 gap-x-10 gap-y-7 lg:grid-cols-2">
                 {[selectedFixture.teamA, selectedFixture.teamB].map((team) => {
                   const rating = ratings.find((item) => item.team.toLowerCase() === team.toLowerCase());
                   if (!rating) return null;
@@ -2025,38 +2256,46 @@ function App() {
               </section>
 
               <MatchIntelPanel fixture={selectedFixture} intel={selectedIntel} />
+
+              {/* Right-column dashboard, now below as a ruled grid */}
+              <section className="grid grid-cols-1 gap-x-10 md:grid-cols-2">
+                <article className="md:border-r md:border-[var(--rule)] md:pr-8 pb-6">
+                  <p className="eyebrow pitch">Publishing State</p>
+                  <h3 className="mt-1 text-ink font-display [font-variation-settings:'opsz'_60] font-medium text-[1.1rem] tracking-[-0.015em] pb-3 mb-3 border-b border-[var(--rule)]">
+                    Ready to ship
+                  </h3>
+                  <dl className="grid gap-3">
+                    {[
+                      ["Content", selectedFixture.contentStatus],
+                      ["Providers", `${providerCount}/${providerTotal}`],
+                      ["Source", stateSource],
+                      ["Buffer", "Dry-run safe"],
+                    ].map(([k, v]) => (
+                      <div key={k} className="flex items-baseline justify-between gap-3 border-b border-[var(--rule)] pb-2 last:border-b-0">
+                        <dt className="caption">{k}</dt>
+                        <dd className="text-sm text-ink font-medium">{v}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </article>
+                <article className="pb-6 md:pl-2">
+                  <p className="eyebrow gold">Scenario Watch</p>
+                  <h3 className="mt-1 text-ink font-display [font-variation-settings:'opsz'_60] font-medium text-[1.1rem] tracking-[-0.015em] pb-3 mb-3 border-b border-[var(--rule)]">
+                    What changes the read
+                  </h3>
+                  <div className="grid gap-4">
+                    {scenarios.map((scenario) => (
+                      <div key={scenario.title} className="border-l-2 border-[var(--gold)] pl-4">
+                        <strong className="block text-[0.95rem] font-medium text-ink font-display [font-variation-settings:'opsz'_60]">
+                          {scenario.title}
+                        </strong>
+                        <span className="mt-1 block text-[0.85rem] leading-[1.55] text-[var(--ink-muted)]">{scenario.signal}</span>
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              </section>
             </section>
-
-            <aside className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:col-start-2 xl:grid-cols-[1fr_1fr] 2xl:grid-cols-[0.85fr_0.85fr_1fr]">
-              <article className="border border-line-border/45 bg-[#101b17] p-5 md:p-6 text-[#f6efe0]">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-[#c9972d]">Publishing State</p>
-                <div className="mt-5 grid gap-3">
-                  {[
-                    ["Content", selectedFixture.contentStatus],
-                    ["Providers", `${providerCount}/${providerTotal}`],
-                    ["Source", stateSource],
-                    ["Buffer", "Dry-run safe"],
-                  ].map(([label, value]) => (
-                    <div key={label} className="flex items-center justify-between border-b border-[#f6efe0]/10 pb-3 last:border-b-0">
-                      <span className="text-xs font-black uppercase tracking-[0.16em] text-[#c9972d]">{label}</span>
-                      <strong className="text-right text-sm font-black">{value}</strong>
-                    </div>
-                  ))}
-                </div>
-              </article>
-
-              <article className="border border-line-border/45 bg-paper p-5 md:col-span-2 md:p-6 2xl:col-span-1">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Scenario Watch</p>
-                <div className="mt-5 grid gap-3">
-                  {scenarios.map((scenario) => (
-                    <div key={scenario.title} className="border-l border-signal-gold/45 pl-4">
-                      <strong className="block text-sm font-black text-ink">{scenario.title}</strong>
-                      <span className="mt-1 block text-xs leading-5 text-muted-text">{scenario.signal}</span>
-                    </div>
-                  ))}
-                </div>
-              </article>
-            </aside>
           </section>
         )}
 
@@ -2081,263 +2320,276 @@ function App() {
         )}
 
         {activeView === "lab" && (
-          <section className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <article className="border border-[#d0b36a]/25 bg-[#101b17] p-6 md:p-8 text-[#f6efe0] xl:col-span-2">
-              <p className="text-[10px] font-black uppercase tracking-[0.28em] text-[#c9972d]">Prediction Lab</p>
-              <div className="mt-5 grid gap-6 lg:grid-cols-[1fr_360px] lg:items-end">
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-10 gap-y-6">
+              <div>
+                <p className="eyebrow gold">Prediction Lab — pre-window read</p>
+                <h1 className="mt-3 text-ink">Test the match before the timeline moves.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Build scenario reads, rank volatility, and decide what content angle deserves attention before the match window opens.
+                </p>
+                <div className="hr-gold mt-4" />
+              </div>
+              <div className="lg:pt-2 grid grid-cols-2 border-t border-[var(--rule)] self-end">
+                <Metric label="Attention" value={String(marketContext.attentionScore)} />
+                <Metric label="Volatility" value={String(marketContext.volatilityScore)} />
+              </div>
+            </header>
+
+            {/* Scenario builder + content radar */}
+            <section className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.4fr)_minmax(280px,1fr)] gap-x-12 gap-y-10">
+              <article>
+                <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
+                  <div>
+                    <p className="eyebrow pitch">Scenario Builder</p>
+                    <h2 className="mt-1 text-ink">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
+                  </div>
+                  <span className="caption">{scenarios.length} cases</span>
+                </div>
+                <div className="mt-5 grid gap-0 border-t border-[var(--rule)]">
+                  {scenarios.map((scenario, index) => (
+                    <article className="grid grid-cols-[48px_minmax(0,1fr)] gap-5 py-5 border-b border-[var(--rule)]" key={scenario.title}>
+                      <span className="figure text-[1.4rem] leading-none text-[var(--ink-quiet)] pt-1">{String(index + 1).padStart(2, "0")}</span>
+                      <div>
+                        <h3 className="text-ink font-display [font-variation-settings:'opsz'_60] font-medium text-[1.1rem] tracking-[-0.015em]">{scenario.title}</h3>
+                        <dl className="mt-3 grid gap-1.5 text-[0.875rem] leading-[1.55] text-[var(--ink-muted)]">
+                          <div><dt className="inline caption pr-1">Trigger</dt><dd className="inline">{scenario.trigger}</dd></div>
+                          <div><dt className="inline caption pr-1">Signal</dt><dd className="inline">{scenario.signal}</dd></div>
+                          <div><dt className="inline caption pr-1">Angle</dt><dd className="inline">{scenario.contentAngle}</dd></div>
+                        </dl>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </article>
+
+              <aside>
+                <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
+                  <div>
+                    <p className="eyebrow pitch">Content Radar</p>
+                    <h2 className="mt-1 text-ink">Priority queue</h2>
+                  </div>
+                  <span className="caption">{rankedFixtures.length} matches</span>
+                </div>
+                <div className="mt-2 grid max-h-[560px] gap-0 overflow-y-auto -mr-2 pr-2">
+                  {rankedFixtures.map(({ fixture, prediction: fixturePrediction, score, label }, index) => {
+                    const isSelected = fixture.id === selectedFixture.id;
+                    return (
+                      <button
+                        key={fixture.id}
+                        className="w-full text-left min-h-0 p-0 border-0"
+                        onClick={() => setSelectedId(fixture.id)}
+                        style={{
+                          borderBottom: "1px solid var(--rule)",
+                          borderLeft: isSelected ? "2px solid var(--gold)" : "2px solid transparent",
+                          background: isSelected ? "var(--paper-raised)" : "transparent",
+                          paddingLeft: 12,
+                        }}
+                      >
+                        <div className="flex items-baseline justify-between gap-3 py-3 pr-2">
+                          <span className="caption tabular pt-0.5">{String(index + 1).padStart(2, "0")}</span>
+                          <strong className="min-w-0 flex-1 text-[0.9rem] font-medium leading-tight text-ink truncate">
+                            {fixture.teamA}
+                            <span className="text-[var(--ink-quiet)] mx-1.5 italic font-display [font-variation-settings:'opsz'_60]">vs</span>
+                            {fixture.teamB}
+                          </strong>
+                          <span className="figure text-[1.2rem] leading-none text-ink">{score}</span>
+                        </div>
+                        <p className="pb-3 pr-2 text-[0.72rem] uppercase tracking-[0.08em] text-[var(--ink-quiet)]">
+                          {fixturePrediction.upsetRisk} risk · {fixturePrediction.goalPotential} goals · {label}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </aside>
+            </section>
+
+            {/* Market context */}
+            <section className="market-context">
+              <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                 <div>
-                  <h2 className="text-[clamp(2rem,4.4vw,4.6rem)] font-black leading-[0.92] tracking-[-0.055em]">
-                    Test the match before the timeline moves.
-                  </h2>
-                  <p className="mt-5 max-w-[720px] text-base leading-7 text-[#d9d0bd]">
-                    Build scenario reads, rank volatility, and decide what content angle deserves attention before the match window opens.
-                  </p>
+                  <p className="eyebrow pitch">Market Context</p>
+                  <h2 className="mt-1 text-ink">Attention &amp; volatility signals</h2>
                 </div>
-                <div className="grid gap-3 border border-[#f6efe0]/10 bg-[#f6efe0]/5 p-4">
-                  <Metric label="Attention" value={String(marketContext.attentionScore)} />
-                  <Metric label="Volatility" value={String(marketContext.volatilityScore)} />
-                </div>
+                <span className="caption">editorial — not betting</span>
               </div>
-            </article>
-
-            <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-              <div className="border-b border-line-border/35 pb-4">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Scenario Builder</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
-              </div>
-              <div className="mt-5 grid gap-4">
-                {scenarios.map((scenario, index) => (
-                  <article className="border-l border-signal-gold/50 bg-field-bg/55 p-4 pl-5" key={scenario.title}>
-                    <span className="font-mono text-[10px] font-black text-signal-gold">0{index + 1}</span>
-                    <h3 className="mt-2 text-base font-black tracking-[-0.03em] text-ink">{scenario.title}</h3>
-                    <p className="mt-2 text-xs leading-5 text-muted-text"><b className="text-ink">Trigger:</b> {scenario.trigger}</p>
-                    <p className="mt-2 text-xs leading-5 text-muted-text"><b className="text-ink">Signal:</b> {scenario.signal}</p>
-                    <p className="mt-2 text-xs leading-5 text-muted-text"><b className="text-ink">Angle:</b> {scenario.contentAngle}</p>
-                  </article>
-                ))}
-              </div>
-            </article>
-
-            <aside className="border border-line-border/45 bg-paper p-5 md:p-6">
-              <div className="border-b border-line-border/35 pb-4">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Content Radar</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Priority Queue</h2>
-              </div>
-              <div className="mt-5 grid max-h-[520px] gap-2 overflow-y-auto pr-1">
-                {rankedFixtures.map(({ fixture, prediction: fixturePrediction, score, label }, index) => (
-                  <button key={fixture.id} className="w-full border border-line-border/35 bg-field-bg/55 p-3 text-left hover:border-signal-gold/45" onClick={() => setSelectedId(fixture.id)}>
-                    <div className="flex items-start justify-between gap-3">
-                      <span className="font-mono text-[10px] font-black text-signal-gold">{String(index + 1).padStart(2, "0")}</span>
-                      <strong className="min-w-0 flex-1 text-sm font-black leading-tight text-ink">{fixture.teamA} vs {fixture.teamB}</strong>
-                      <span className="font-mono text-xs font-black text-signal-gold">{score}</span>
-                    </div>
-                    <p className="mt-2 text-[10px] font-bold uppercase tracking-[0.1em] text-muted-text">
-                      {fixturePrediction.upsetRisk} risk / {fixturePrediction.goalPotential} goals / {label}
-                    </p>
-                  </button>
-                ))}
-              </div>
-            </aside>
-
-            <article className="border border-line-border/45 bg-paper p-5 md:p-6 xl:col-span-2">
-              <div className="border-b border-line-border/35 pb-4">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Market Context</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Attention & Volatility Signals</h2>
-              </div>
-              <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <div className="context-meters">
                 <Metric label="Momentum" value={marketContext.mediaMomentum} />
                 <Metric label="Attention score" value={String(marketContext.attentionScore)} />
                 <Metric label="Volatility score" value={String(marketContext.volatilityScore)} />
                 <Metric label="Content priority" value={interestLabelFor(clamp(marketContext.attentionScore + marketContext.volatilityScore / 2, 0, 100))} />
               </div>
-              <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div className="context-signal-list">
                 {marketContext.signals.map((signal) => (
-                  <article className="border border-line-border/35 bg-field-bg/55 p-4" key={signal.label}>
-                    <strong className="text-xs font-black uppercase tracking-[0.16em] text-signal-gold">{signal.label}</strong>
-                    <span className="mt-3 block font-mono text-2xl font-black text-ink">{signal.score}/100</span>
-                    <p className="mt-2 text-xs leading-5 text-muted-text">{signal.note}</p>
+                  <article className="context-signal" key={signal.label}>
+                    <strong>{signal.label}</strong>
+                    <span>{signal.score}<span className="text-[var(--ink-quiet)] text-[0.85rem]">/100</span></span>
+                    <p>{signal.note}</p>
                   </article>
                 ))}
               </div>
-            </article>
+            </section>
           </section>
         )}
 
         {activeView === "brand" && (
-          <section className="flex flex-col gap-6">
-            <section className="relative overflow-hidden border border-[#d0b36a]/25 bg-[#101b17] text-[#f6efe0]">
-              <div className="absolute inset-y-0 right-0 w-[46%] bg-[#10543f]/55" />
-              <div className="absolute right-[-180px] top-[-220px] h-[520px] w-[520px] rounded-full border-[44px] border-[#c9972d]/20" />
-              <div className="relative grid gap-0 lg:grid-cols-[1.05fr_0.95fr]">
-                <div className="p-7 md:p-10">
-                  <p className="text-[10px] font-black uppercase tracking-[0.28em] text-[#c9972d]">Brand Command</p>
-                  <h2 className="mt-6 max-w-[760px] text-[clamp(2.25rem,5.2vw,5.5rem)] font-black leading-[0.9] tracking-[-0.055em]">
-                    Field Intelligence, built for social velocity.
-                  </h2>
-                  <p className="mt-6 max-w-[640px] text-base leading-7 text-[#d9d0bd]">
-                    The Match Signal now has a premium asset system, platform handles, content pillars, and match-specific captions. This view is the control surface for keeping every post recognizable.
-                  </p>
-                  <div className="mt-8 grid max-w-[720px] gap-3 sm:grid-cols-3">
-                    {[
-                      ["Instagram", "@thematchsignal"],
-                      ["X", "@thematchsignal"],
-                      ["YouTube", "@TheMatchSignal"],
-                    ].map(([label, value]) => (
-                      <div key={label} className="border border-[#d0b36a]/25 bg-[#f6efe0]/5 p-4">
-                        <span className="text-[10px] font-black uppercase tracking-[0.22em] text-[#c9972d]">{label}</span>
-                        <strong className="mt-2 block text-sm font-black text-[#f6efe0]">{value}</strong>
-                      </div>
-                    ))}
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-12 gap-y-6">
+              <div>
+                <p className="eyebrow gold">Brand Command — editorial system</p>
+                <h1 className="mt-3 text-ink">Field Intelligence, built for social velocity.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">
+                  The Match Signal has a premium asset system, platform handles, content pillars, and match-specific captions. This view is the control surface for keeping every post recognisable.
+                </p>
+                <div className="hr-gold mt-4" />
+              </div>
+              <div className="self-end grid grid-cols-3 border-t border-[var(--rule)]">
+                {[
+                  ["Instagram", "@thematchsignal"],
+                  ["X", "@thematchsignal"],
+                  ["YouTube", "@TheMatchSignal"],
+                ].map(([label, value]) => (
+                  <div key={label} className="flex flex-col gap-1.5 py-4 pr-4 border-r last:border-r-0 border-[var(--rule)]">
+                    <span className="caption">{label}</span>
+                    <strong className="text-[0.95rem] font-medium text-ink truncate">{value}</strong>
                   </div>
-                </div>
+                ))}
+              </div>
+            </header>
 
-                <div className="relative min-h-[420px] border-t border-[#f6efe0]/10 lg:border-l lg:border-t-0">
-                  <div className="absolute inset-10 border border-[#f6efe0]/10" />
-                  <div className="absolute inset-x-10 top-1/2 border-t border-[#f6efe0]/10" />
-                  <div className="absolute inset-y-10 left-1/2 border-l border-[#f6efe0]/10" />
-                  <div className="absolute left-1/2 top-1/2 grid h-56 w-56 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border-[16px] border-[#c9972d] bg-[#10543f]">
-                    <div className="text-center">
-                      <div className="text-6xl font-black tracking-[-0.08em]">MS</div>
-                      <div className="mx-auto mt-4 h-2 w-28 rounded-full bg-[#c9972d]" />
-                    </div>
-                  </div>
-                  <div className="absolute bottom-8 left-8 right-8 flex justify-between text-[10px] font-black uppercase tracking-[0.22em] text-[#c9972d]">
-                    <span>Avatar</span>
-                    <span>Banner</span>
-                    <span>Post</span>
-                  </div>
+            {/* Pillars */}
+            <section>
+              <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow pitch">Editorial system</p>
+                  <h2 className="mt-1 text-ink">Brand pillars</h2>
                 </div>
+                <span className="caption">{brandPillars.length} pillars</span>
+              </div>
+              <div className="pillar-grid">
+                {brandPillars.map((pillar, index) => (
+                  <article className="pillar-card" key={pillar.title}>
+                    <span className="caption tabular">{String(index + 1).padStart(2, "0")}</span>
+                    <h3 className="mt-2">{pillar.title}</h3>
+                    <p>{pillar.detail}</p>
+                  </article>
+                ))}
               </div>
             </section>
 
-            <section className="grid grid-cols-1 xl:grid-cols-[0.95fr_1.15fr_0.9fr] gap-5">
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="flex items-start justify-between gap-4 border-b border-line-border/35 pb-4">
+            {/* Voice + assets, side by side */}
+            <section className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-12 gap-y-10">
+              <article>
+                <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                   <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Premium Files</p>
-                    <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Use These Assets</h2>
+                    <p className="eyebrow pitch">Voice guardrails</p>
+                    <h2 className="mt-1 text-ink">Publish without drift</h2>
                   </div>
-                  <Image size={22} className="text-signal-gold" />
+                  <span className="caption">{voiceRules.length} rules</span>
                 </div>
-                <div className="mt-5 grid gap-3">
+                <ol className="mt-5 grid gap-0 border-t border-[var(--rule)]">
+                  {voiceRules.map((rule, i) => (
+                    <li key={rule} className="grid grid-cols-[40px_minmax(0,1fr)] py-4 border-b border-[var(--rule)] text-[0.95rem] leading-[1.55] text-[var(--ink-muted)]">
+                      <span className="figure text-[1.1rem] text-[var(--ink-quiet)]">{String(i + 1).padStart(2, "0")}</span>
+                      <span className="text-ink">{rule}</span>
+                    </li>
+                  ))}
+                </ol>
+              </article>
+
+              <article>
+                <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
+                  <div>
+                    <p className="eyebrow pitch">Premium files</p>
+                    <h2 className="mt-1 text-ink">Use these assets</h2>
+                  </div>
+                  <Image size={16} className="text-[var(--ink-quiet)]" />
+                </div>
+                <div className="mt-5 grid gap-0 border-t border-[var(--rule)]">
                   {[
                     ["Profile avatar", "match-signal-premium-avatar-2048.png", "All social profiles"],
                     ["Instagram intro", "match-signal-instagram-intro-1080x1350.png", "Pinned feed launch"],
                     ["YouTube banner", "match-signal-youtube-banner-2048x1152.png", "Channel art"],
                     ["X header", "match-signal-x-header-1500x500.png", "Profile header"],
                   ].map(([label, file, use]) => (
-                    <div key={file} className="border-l border-signal-gold/45 bg-field-bg/50 p-3 pl-4">
-                      <strong className="block text-sm font-black text-ink">{label}</strong>
-                      <span className="mt-1 block font-mono text-[10px] text-muted-text">{file}</span>
-                      <span className="mt-1 block text-xs font-bold text-muted-text">{use}</span>
+                    <div key={file} className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-6 gap-y-1 py-4 border-b border-[var(--rule)]">
+                      <strong className="text-[0.95rem] font-medium text-ink font-display [font-variation-settings:'opsz'_60]">{label}</strong>
+                      <span className="caption text-[var(--ink-quiet)] text-right">{use}</span>
+                      <span className="col-span-2 font-mono text-[0.72rem] text-[var(--ink-quiet)] truncate">{file}</span>
                     </div>
                   ))}
                 </div>
-              </article>
-
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="flex items-start justify-between gap-4 border-b border-line-border/35 pb-4">
-                  <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Editorial System</p>
-                    <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Brand Pillars</h2>
-                  </div>
-                  <Layers size={22} className="text-signal-gold" />
-                </div>
-                <div className="mt-5 grid gap-4 sm:grid-cols-2">
-                  {brandPillars.map((pillar, index) => (
-                    <div key={pillar.title} className="border border-line-border/35 bg-field-bg/55 p-4">
-                      <span className="font-mono text-[10px] font-black text-signal-gold">0{index + 1}</span>
-                      <h3 className="mt-2 text-base font-black tracking-[-0.03em] text-ink">{pillar.title}</h3>
-                      <p className="mt-2 text-sm leading-6 text-muted-text">{pillar.detail}</p>
-                    </div>
-                  ))}
-                </div>
-              </article>
-
-              <article className="border border-line-border/45 bg-[#101b17] p-5 md:p-6 text-[#f6efe0]">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-[#c9972d]">Voice Guardrails</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em]">Publish Without Drift</h2>
-                <ul className="mt-5 space-y-3">
-                  {voiceRules.map((rule) => (
-                    <li key={rule} className="border-b border-[#f6efe0]/10 pb-3 text-sm leading-6 text-[#d9d0bd] last:border-b-0">
-                      {rule}
-                    </li>
-                  ))}
-                </ul>
               </article>
             </section>
 
-            <section className="grid grid-cols-1 lg:grid-cols-[0.85fr_1.15fr] gap-5">
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="flex items-start justify-between gap-4 border-b border-line-border/35 pb-4">
+            {/* Palette + content pillars */}
+            <section className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-12 gap-y-10">
+              <article>
+                <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                   <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Visual Identity</p>
-                    <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Signal Palette</h2>
+                    <p className="eyebrow pitch">Visual identity</p>
+                    <h2 className="mt-1 text-ink">Signal palette</h2>
                   </div>
-                  <Palette size={22} className="text-signal-gold" />
+                  <Palette size={16} className="text-[var(--ink-quiet)]" />
                 </div>
-                <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <div className="swatch-grid">
                   {visualSystem.map((item) => (
-                    <div className="flex items-center gap-3 border border-line-border/35 bg-field-bg/55 p-3" key={item.label}>
-                      <span className="h-10 w-10 border border-[#101b17]/10" style={{ background: item.swatch }} />
+                    <div className="swatch-card" key={item.label}>
+                      <span className="swatch" style={{ background: item.swatch }} />
                       <div>
-                        <strong className="block text-sm font-black text-ink">{item.label}</strong>
-                        <small className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-muted-text">{item.value}</small>
+                        <strong className="block text-[0.95rem] font-medium text-ink">{item.label}</strong>
+                        <small>{item.value}</small>
                       </div>
                     </div>
                   ))}
                 </div>
               </article>
 
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="flex items-start justify-between gap-4 border-b border-line-border/35 pb-4">
+              <article>
+                <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                   <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Series Engine</p>
-                    <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Repeatable Content Lanes</h2>
+                    <p className="eyebrow pitch">Series engine</p>
+                    <h2 className="mt-1 text-ink">Repeatable content lanes</h2>
                   </div>
-                  <Hash size={22} className="text-signal-gold" />
+                  <Hash size={16} className="text-[var(--ink-quiet)]" />
                 </div>
-                <div className="mt-5 flex flex-wrap gap-2">
+                <div className="tag-cloud">
                   {contentPillars.map((pillar) => (
-                    <span className="border border-signal-gold/35 bg-signal-gold/10 px-3 py-2 text-xs font-black uppercase tracking-[0.14em] text-ink" key={pillar}>
-                      {pillar}
-                    </span>
+                    <span key={pillar}>{pillar}</span>
                   ))}
                 </div>
               </article>
             </section>
 
-            <section className="border border-line-border/45 bg-paper p-5 md:p-6">
-              <div className="flex flex-col gap-4 border-b border-line-border/35 pb-4 md:flex-row md:items-start md:justify-between">
+            {/* Platform kit */}
+            <section>
+              <div className="flex flex-wrap items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                 <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Platform Kit</p>
-                  <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
+                  <p className="eyebrow pitch">Platform kit</p>
+                  <h2 className="mt-1 text-ink">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
                 </div>
-                <Button variant="glass" icon={<Hash size={14} />} onClick={() => copy("Hashtags", hashtagsFor(selectedFixture).join(" "))} className="h-9 text-xs">
+                <Button variant="secondary" icon={<Hash size={14} />} onClick={() => copy("Hashtags", hashtagsFor(selectedFixture).join(" "))}>
                   {copied === "Hashtags" ? "Copied" : "Copy hashtags"}
                 </Button>
               </div>
-              <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <div className="platform-grid">
                 {socialKit.map((item) => (
-                  <article className="flex min-h-[420px] flex-col justify-between border border-line-border/40 bg-field-bg/60 p-4" key={item.platform}>
-                    <div>
-                      <div className="flex items-center gap-3 border-b border-line-border/25 pb-3">
-                        <span className="text-signal-gold">{platformIconFor(item.platform)}</span>
-                        <div>
-                          <h3 className="text-sm font-black tracking-[-0.02em] text-ink">{item.platform}</h3>
-                          <small className="mt-0.5 block text-[9px] font-black uppercase tracking-[0.18em] text-muted-text">{item.format} / {item.cadence}</small>
-                        </div>
+                  <article className="platform-card" key={item.platform}>
+                    <div className="platform-heading">
+                      {platformIconFor(item.platform)}
+                      <div>
+                        <h3>{item.platform}</h3>
+                        <small>{item.format} · {item.cadence}</small>
                       </div>
-                      <div className="mt-4 space-y-3 text-sm leading-6 text-muted-text">
-                        <p><b className="font-black text-ink">Hook:</b> {item.hook}</p>
-                        <p><b className="font-black text-ink">Creative:</b> {item.creative}</p>
-                        <p><b className="font-black text-ink">CTA:</b> {item.cta}</p>
-                      </div>
-                      <pre className="mt-4 max-h-40 overflow-y-auto border border-[#d0b36a]/20 bg-[#101b17] p-3 font-mono text-[11px] leading-5 text-[#f6efe0] whitespace-pre-wrap">
-                        {item.caption}
-                      </pre>
                     </div>
-                    <Button variant="glass" icon={<Clipboard size={14} />} onClick={() => copy(item.platform, item.caption)} className="mt-4 h-9 w-full text-xs">
+                    <p className="text-[0.85rem]"><span className="caption pr-1">Hook</span>{item.hook}</p>
+                    <p className="text-[0.85rem]"><span className="caption pr-1">Creative</span>{item.creative}</p>
+                    <p className="text-[0.85rem]"><span className="caption pr-1">CTA</span>{item.cta}</p>
+                    <pre>{item.caption}</pre>
+                    <Button variant="ghost" icon={<Clipboard size={13} />} onClick={() => copy(item.platform, item.caption)}>
                       {copied === item.platform ? "Copied" : "Copy caption"}
                     </Button>
                   </article>
@@ -2348,108 +2600,95 @@ function App() {
         )}
 
         {activeView === "content" && (
-          <section className="flex flex-col gap-6">
-            <section className="grid grid-cols-1 gap-5 xl:grid-cols-[1.1fr_0.9fr]">
-              <article className="border border-[#d0b36a]/25 bg-[#101b17] p-6 md:p-8 text-[#f6efe0]">
-                <div className="flex flex-col gap-5 md:flex-row md:items-start md:justify-between">
-                  <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.28em] text-[#c9972d]">Publishing Desk</p>
-                    <h2 className="mt-4 max-w-[760px] text-[clamp(2rem,4.8vw,4.8rem)] font-black leading-[0.92] tracking-[-0.055em]">
-                      Package the signal. Hold the standard.
-                    </h2>
-                    <p className="mt-5 max-w-[660px] text-base leading-7 text-[#d9d0bd]">
-                      Every output for {selectedFixture.teamA} vs {selectedFixture.teamB} should move from intelligence to channel-native copy without drifting into hype, guesswork, or gambling language.
-                    </p>
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-12 gap-y-6">
+              <div>
+                <p className="eyebrow gold">Publishing Desk · matchday output</p>
+                <h1 className="mt-3 text-ink">Package the signal. Hold the standard.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Every output for {selectedFixture.teamA} vs {selectedFixture.teamB} moves from intelligence to channel-native copy without drifting into hype, guesswork, or gambling language.
+                </p>
+                <div className="hr-gold mt-4" />
+              </div>
+              <div className="self-end grid grid-cols-3 border-t border-[var(--rule)]">
+                {[
+                  ["Status", selectedFixture.contentStatus],
+                  ["Confidence", `${prediction.confidence}/10`],
+                  ["Priority", interestLabelFor(selectedInterest)],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex flex-col gap-1.5 py-4 pr-4 border-r last:border-r-0 border-[var(--rule)]">
+                    <span className="caption">{k}</span>
+                    <strong className="figure text-[clamp(1.1rem,1.6vw,1.4rem)] text-ink leading-none truncate">{v}</strong>
                   </div>
-                  <div className="grid min-w-[260px] gap-3 border border-[#f6efe0]/10 bg-[#f6efe0]/5 p-4">
-                    <div className="flex items-center justify-between border-b border-[#f6efe0]/10 pb-3">
-                      <span className="text-xs font-black uppercase tracking-[0.18em] text-[#c9972d]">Status</span>
-                      <strong className="text-sm font-black">{selectedFixture.contentStatus}</strong>
-                    </div>
-                    <div className="flex items-center justify-between border-b border-[#f6efe0]/10 pb-3">
-                      <span className="text-xs font-black uppercase tracking-[0.18em] text-[#c9972d]">Confidence</span>
-                      <strong className="font-mono text-sm font-black">{prediction.confidence}/10</strong>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-black uppercase tracking-[0.18em] text-[#c9972d]">Priority</span>
-                      <strong className="text-sm font-black">{interestLabelFor(selectedInterest)}</strong>
-                    </div>
-                  </div>
-                </div>
-                <div className="mt-8 grid gap-3 md:grid-cols-4">
-                  <Button variant="primary" icon={<Sparkles size={15} />} onClick={generateWithAI} loading={loading.generateWithAI}>
-                    Generate Pack
-                  </Button>
-                  <Button variant="outline" icon={<Radio size={15} />} onClick={sendTelegramPreview} loading={loading.sendTelegramPreview}>
-                    Admin Preview
-                  </Button>
-                  <Button variant="outline" icon={<Send size={15} />} onClick={socialDryRun} loading={loading.socialDryRun}>
-                    Buffer Dry Run
-                  </Button>
-                  <Button variant="outline" icon={<ShieldCheck size={15} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Approved" })}>
-                    Approve
-                  </Button>
-                </div>
-              </article>
+                ))}
+              </div>
+            </header>
 
-              <article className="border border-line-border/45 bg-paper p-6 md:p-8">
-                <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Channel Readiness</p>
-                <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Connected Social Stack</h2>
-                <div className="mt-6 grid gap-3">
-                  {[
-                    ["Instagram", "Media required", "Connected via Buffer"],
-                    ["X", "Text draft tested", "Buffer write works"],
-                    ["TikTok", "Video required", "Connected via Buffer"],
-                    ["YouTube", "Short + banner ready", "Connect in Buffer next"],
-                  ].map(([channel, requirement, status]) => (
-                    <div key={channel} className="grid grid-cols-[1fr_auto] gap-4 border-b border-line-border/35 pb-3 last:border-b-0">
-                      <div>
-                        <strong className="block text-sm font-black text-ink">{channel}</strong>
-                        <span className="mt-1 block text-xs font-bold text-muted-text">{requirement}</span>
-                      </div>
-                      <span className="self-start border border-signal-gold/35 bg-signal-gold/10 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em] text-ink">
-                        {status}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </article>
-            </section>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="primary" icon={<Sparkles size={14} />} onClick={generateWithAI} loading={loading.generateWithAI}>Generate pack</Button>
+              <Button variant="secondary" icon={<Radio size={14} />} onClick={sendTelegramPreview} loading={loading.sendTelegramPreview}>Admin preview</Button>
+              <Button variant="secondary" icon={<Send size={14} />} onClick={socialDryRun} loading={loading.socialDryRun}>Buffer dry run</Button>
+              <Button variant="success" icon={<ShieldCheck size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Approved" })}>Approve</Button>
+            </div>
 
-            <section className="grid grid-cols-1 gap-5 xl:grid-cols-[1fr_1fr]">
-              <OutputPanel title="Telegram Brief" icon={<Radio size={18} />} text={content.telegram} onCopy={() => copy("Telegram", content.telegram)} copied={copied === "Telegram"} onPublish={sendTelegramPublic} disabled={loading.sendTelegramPublic} />
-              <OutputPanel title="X Post" icon={<Megaphone size={18} />} text={content.xPost} onCopy={() => copy("X Post", content.xPost)} copied={copied === "X Post"} />
-              <OutputPanel title="Shorts Script" icon={<Film size={18} />} text={content.shortsScript} onCopy={() => copy("Shorts", content.shortsScript)} copied={copied === "Shorts"} />
-              <OutputPanel title="Market Context" icon={<BarChart3 size={18} />} text={content.bettingAngle} onCopy={() => copy("Market Context", content.bettingAngle)} copied={copied === "Market Context"} onPublish={sendTelegramBetting} disabled={loading.sendTelegramBetting} />
-            </section>
-
-            <section className="border border-line-border/45 bg-paper p-5 md:p-6">
-              <div className="flex flex-col gap-4 border-b border-line-border/35 pb-4 md:flex-row md:items-start md:justify-between">
+            {/* Channel readiness */}
+            <section>
+              <div className="flex items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
                 <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Platform Variants</p>
-                  <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Channel-Native Captions</h2>
+                  <p className="eyebrow pitch">Channel readiness</p>
+                  <h2 className="mt-1 text-ink">Connected social stack</h2>
                 </div>
-                <Button variant="glass" icon={<Hash size={14} />} onClick={() => copy("Hashtags", hashtagsFor(selectedFixture).join(" "))} className="h-9 text-xs">
+                <span className="caption">4 channels</span>
+              </div>
+              <div className="mt-2 grid gap-0">
+                {[
+                  ["Instagram", "Media required", "Connected via Buffer"],
+                  ["X", "Text draft tested", "Buffer write works"],
+                  ["TikTok", "Video required", "Connected via Buffer"],
+                  ["YouTube", "Short + banner ready", "Connect in Buffer next"],
+                ].map(([channel, requirement, status]) => (
+                  <div key={channel} className="grid grid-cols-[180px_minmax(0,1fr)_auto] items-baseline gap-4 py-4 border-b border-[var(--rule)]">
+                    <strong className="text-[1rem] font-medium text-ink font-display [font-variation-settings:'opsz'_60]">{channel}</strong>
+                    <span className="text-[0.9rem] text-[var(--ink-muted)]">{requirement}</span>
+                    <span className="caption text-pitch">{status}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Outputs */}
+            <section className="grid grid-cols-1 gap-x-12 gap-y-10 xl:grid-cols-2">
+              <OutputPanel title="Telegram Brief" icon={<Radio size={16} />} text={content.telegram} onCopy={() => copy("Telegram", content.telegram)} copied={copied === "Telegram"} onPublish={sendTelegramPublic} disabled={loading.sendTelegramPublic} />
+              <OutputPanel title="X Post" icon={<Megaphone size={16} />} text={content.xPost} onCopy={() => copy("X Post", content.xPost)} copied={copied === "X Post"} />
+              <OutputPanel title="Shorts Script" icon={<Film size={16} />} text={content.shortsScript} onCopy={() => copy("Shorts", content.shortsScript)} copied={copied === "Shorts"} />
+              <OutputPanel title="Market Context" icon={<BarChart3 size={16} />} text={content.marketContext || content.bettingAngle} onCopy={() => copy("Market Context", content.marketContext || content.bettingAngle)} copied={copied === "Market Context"} onPublish={sendTelegramMarketContext} disabled={loading.sendTelegramMarketContext} />
+            </section>
+
+            {/* Platform-native captions */}
+            <section>
+              <div className="flex flex-wrap items-baseline justify-between gap-3 pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow pitch">Platform variants</p>
+                  <h2 className="mt-1 text-ink">Channel-native captions</h2>
+                </div>
+                <Button variant="secondary" icon={<Hash size={14} />} onClick={() => copy("Hashtags", hashtagsFor(selectedFixture).join(" "))}>
                   {copied === "Hashtags" ? "Copied" : "Copy hashtags"}
                 </Button>
               </div>
-              <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <div className="platform-grid">
                 {socialKit.map((item) => (
-                  <article key={item.platform} className="flex min-h-[360px] flex-col justify-between border border-line-border/40 bg-field-bg/60 p-4">
-                    <div>
-                      <div className="flex items-center gap-3 border-b border-line-border/25 pb-3">
-                        <span className="text-signal-gold">{platformIconFor(item.platform)}</span>
-                        <div>
-                          <h3 className="text-sm font-black tracking-[-0.02em] text-ink">{item.platform}</h3>
-                          <small className="mt-0.5 block text-[9px] font-black uppercase tracking-[0.18em] text-muted-text">{item.format}</small>
-                        </div>
+                  <article key={item.platform} className="platform-card">
+                    <div className="platform-heading">
+                      {platformIconFor(item.platform)}
+                      <div>
+                        <h3>{item.platform}</h3>
+                        <small>{item.format}</small>
                       </div>
-                      <p className="mt-4 text-sm font-black leading-5 text-ink">{item.hook}</p>
-                      <pre className="mt-4 max-h-44 overflow-y-auto border border-[#d0b36a]/20 bg-[#101b17] p-3 font-mono text-[11px] leading-5 text-[#f6efe0] whitespace-pre-wrap">
-                        {item.caption}
-                      </pre>
                     </div>
-                    <Button variant="glass" icon={<Clipboard size={14} />} onClick={() => copy(item.platform, item.caption)} className="mt-4 h-9 w-full text-xs">
+                    <p className="text-[0.95rem] text-ink font-display [font-variation-settings:'opsz'_60] font-medium leading-tight">{item.hook}</p>
+                    <pre>{item.caption}</pre>
+                    <Button variant="ghost" icon={<Clipboard size={13} />} onClick={() => copy(item.platform, item.caption)}>
                       {copied === item.platform ? "Copied" : "Copy caption"}
                     </Button>
                   </article>
@@ -2457,368 +2696,623 @@ function App() {
               </div>
             </section>
 
-            <OutputPanel title="Report Section" icon={<FileText size={18} />} text={content.reportSection} onCopy={() => copy("Report", content.reportSection)} copied={copied === "Report"} />
+            <OutputPanel title="Report Section" icon={<FileText size={16} />} text={content.reportSection} onCopy={() => copy("Report", content.reportSection)} copied={copied === "Report"} />
           </section>
         )}
 
         {activeView === "video" && (
-          <section className="grid grid-cols-1 lg:grid-cols-[1.2fr_0.8fr] gap-6">
-            <article className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4">
-              <div className="flex justify-between items-center border-b border-line-border/30 pb-3">
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-12 gap-y-6">
+              <div>
+                <p className="eyebrow gold">Clip factory · {selectedFixture.teamA} vs {selectedFixture.teamB}</p>
+                <h1 className="mt-3 text-ink">Cut the moment. Ship the vertical.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Point to a local source, lift the in/out marks off the scrubber, and render planned clips with branded overlays. The output queue holds the last twelve renders.
+                </p>
+                <div className="hr-gold mt-4" />
+              </div>
+              <div className="lg:self-end flex flex-wrap lg:justify-end gap-2">
+                <Button variant="secondary" icon={<Activity size={14} />} onClick={checkVideoEngine} loading={loading.checkVideoEngine}>Engine status</Button>
+                <Button variant="secondary" icon={<Sparkles size={14} />} onClick={createSampleVideo} loading={loading.createSample}>Create sample</Button>
+              </div>
+            </header>
+
+            <section className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.3fr)_minmax(320px,0.9fr)] gap-x-12 gap-y-12">
+              {/* Left column: source + plans */}
+              <article className="flex flex-col gap-10 min-w-0">
                 <div>
-                  <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-0.5">Clip Factory</p>
-                  <h2 className="text-slate-900 dark:text-ink text-base md:text-lg font-black tracking-tight">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
-                </div>
-                <Button variant="glass" icon={<Activity size={14} />} onClick={checkVideoEngine} loading={loading.checkVideoEngine} className="h-8 text-xs">
-                  Engine
-                </Button>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-3 items-end border-b border-line-border/20 pb-4">
-                <label className="flex flex-col gap-1.5 w-full">
-                  <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider">Source video path</span>
-                  <input
-                    value={clipSourcePath}
-                    onChange={(event) => setClipSourcePath(event.target.value)}
-                    placeholder="C:\\Videos\\match-footage.mp4"
-                    className="w-full bg-field-bg/85 border border-line-border/60 hover:border-line-border rounded-none h-10 px-3.5 text-sm text-ink focus:border-pitch-green focus:outline-none focus:ring-2 focus:ring-pitch-green/20 transition-all duration-200 font-mono"
-                  />
-                </label>
-                <Button variant="glass" icon={<Film size={15} />} onClick={() => probeVideoSource()} loading={loading.probeVideo} className="h-10 text-xs px-4">
-                  Probe
-                </Button>
-                <Button variant="glass" icon={<Sparkles size={15} />} onClick={createSampleVideo} loading={loading.createSample} className="h-10 text-xs px-4">
-                  Create Sample
-                </Button>
-              </div>
-
-              {/* Local Video Preview Player */}
-              {clipSourcePath.trim() && (
-                <div className="flex flex-col gap-2.5 bg-paper-2/45 border border-line-border/30 rounded-none p-4 mt-1">
-                  <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider font-mono">Source Video Streaming Preview</span>
-                  <video
-                    ref={sourceVideoRef}
-                    controls
-                    src={`/api/video/stream?path=${encodeURIComponent(clipSourcePath)}`}
-                    className="w-full max-h-[300px] bg-[#060913] rounded-none border border-line-border/40 object-contain"
-                  />
-                  <div className="flex gap-2">
-                    <Button
-                      variant="glass"
-                      className="text-[11px] h-8 flex-1 uppercase tracking-wider font-extrabold"
-                      onClick={() => {
-                        if (sourceVideoRef.current && selectedClip) {
-                          const currentVal = Math.round(sourceVideoRef.current.currentTime);
-                          setClipPlans(prev => prev.map(c => c.id === selectedClip.id ? { ...c, startTime: currentVal } : c));
-                          setApiMessage(`Set start time to ${currentVal}s`);
-                        }
-                      }}
-                    >
-                      Set Clip Start
+                  <p className="eyebrow pitch">Source</p>
+                  <h2 className="mt-1 text-ink pb-3 border-b border-[var(--rule-strong)]">Local footage</h2>
+                  <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-x-4 gap-y-3 items-end">
+                    <label className="field">
+                      <span>Source video path</span>
+                      <input
+                        value={clipSourcePath}
+                        onChange={(event) => setClipSourcePath(event.target.value)}
+                        placeholder="C:\\Videos\\match-footage.mp4"
+                        className="font-mono"
+                      />
+                    </label>
+                    <Button variant="secondary" icon={<Film size={14} />} onClick={() => probeVideoSource()} loading={loading.probeVideo}>
+                      Probe
                     </Button>
-                    <Button
-                      variant="glass"
-                      className="text-[11px] h-8 flex-1 uppercase tracking-wider font-extrabold"
-                      onClick={() => {
-                        if (sourceVideoRef.current && selectedClip) {
-                          const currentVal = Math.round(sourceVideoRef.current.currentTime);
-                          setClipPlans(prev => prev.map(c => c.id === selectedClip.id ? { ...c, endTime: currentVal } : c));
-                          setApiMessage(`Set end time to ${currentVal}s`);
-                        }
-                      }}
-                    >
-                      Set Clip End
+                    <Button variant="secondary" icon={<Radar size={14} />} onClick={scanForMoments} loading={loading.scan}>
+                      Scan for moments
+                    </Button>
+                  </div>
+
+                  {clipSourcePath.trim() && (
+                    <div className="mt-6 flex flex-col gap-3">
+                      <p className="caption">Source preview</p>
+                      <video
+                        ref={sourceVideoRef}
+                        controls
+                        src={`/api/video/stream?path=${encodeURIComponent(clipSourcePath)}`}
+                        className="w-full max-h-[300px] bg-[var(--ink)] border border-[var(--rule)] object-contain"
+                        onLoadedMetadata={(e) => {
+                          const v = e.currentTarget;
+                          if (v.duration && Number.isFinite(v.duration)) {
+                            setTimelineDuration(v.duration);
+                          }
+                        }}
+                      />
+
+                      {/* Editor-class timeline: thumbnails + waveform + handles + hotkeys */}
+                      <ClipTimeline
+                        duration={timelineDuration || 30}
+                        fps={timelineFps}
+                        inTime={selectedClip?.startTime ?? 0}
+                        outTime={selectedClip?.endTime ?? Math.min(20, timelineDuration || 30)}
+                        thumbs={timelineThumbs}
+                        waveform={timelineWave}
+                        scan={scanResult}
+                        videoRef={sourceVideoRef}
+                        onTrim={({ inTime, outTime }) => {
+                          if (!selectedClip) return;
+                          setClipPlans((prev) =>
+                            prev.map((c) =>
+                              c.id === selectedClip.id
+                                ? {
+                                    ...c,
+                                    startTime: round3(inTime),
+                                    endTime: round3(outTime),
+                                    duration: round3(Math.max(0.1, outTime - inTime)),
+                                  }
+                                : c,
+                            ),
+                          );
+                        }}
+                      />
+
+                      {timelineThumbs.length === 0 && (
+                        <div className="flex items-center gap-3">
+                          <Button
+                            variant="secondary"
+                            icon={<Film size={13} />}
+                            onClick={() => loadTimelineAssets(clipSourcePath)}
+                            loading={loading.timelineAssets}
+                          >
+                            Generate thumbnails &amp; waveform
+                          </Button>
+                          <span className="caption">Required once per source — cached after.</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {scanResult && (
+                    <div className="mt-7">
+                      <div className="flex items-baseline justify-between pb-2 border-b border-[var(--rule)]">
+                        <p className="eyebrow gold">Auto-suggested moments</p>
+                        <span className="caption">
+                          {scanResult.scenes.length} cut{scanResult.scenes.length === 1 ? "" : "s"} ·
+                          {" "}{scanResult.peaks.length} loud window{scanResult.peaks.length === 1 ? "" : "s"} ·
+                          {" "}{Math.round(scanResult.duration)}s
+                        </span>
+                      </div>
+                      {scanResult.crop.recommended && (
+                        <p className="mt-2 text-[0.8rem] text-[var(--ink-muted)]">
+                          Letterbox detected: cropdetect suggests {scanResult.crop.width}×{scanResult.crop.height} at offset {scanResult.crop.x},{scanResult.crop.y}.
+                        </p>
+                      )}
+                      <ol className="mt-3 grid gap-0">
+                        {scanResult.suggestions.length === 0 ? (
+                          <li className="py-3 text-[var(--ink-muted)] text-[0.875rem]">
+                            No drama detected in this pass. Try a longer source, or lower the scene threshold.
+                          </li>
+                        ) : scanResult.suggestions.map((suggestion, i) => (
+                          <li
+                            key={suggestion.id}
+                            className="grid grid-cols-[36px_minmax(0,1fr)_auto_auto] items-baseline gap-4 py-3 border-b border-[var(--rule)] cursor-pointer hover:bg-[var(--paper-raised)]"
+                            onClick={() => applySuggestion(suggestion)}
+                          >
+                            <span className="figure text-[0.95rem] text-[var(--ink-quiet)]">
+                              {String(i + 1).padStart(2, "0")}
+                            </span>
+                            <div className="min-w-0">
+                              <p className="text-[0.9rem] text-ink leading-tight">{suggestion.reason}</p>
+                              <p className="caption mt-0.5">
+                                {suggestion.type} · {suggestion.start.toFixed(1)}s – {suggestion.end.toFixed(1)}s
+                              </p>
+                            </div>
+                            <span className="figure text-[0.95rem] text-[var(--ink)] tabular-nums">
+                              score {suggestion.score.toFixed(2)}
+                            </span>
+                            <Button
+                              variant="ghost"
+                              icon={<Wand2 size={13} />}
+                              onClick={(event) => { event.stopPropagation(); applySuggestion(suggestion); }}
+                            >
+                              Apply
+                            </Button>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <p className="eyebrow pitch">Overlays &amp; render settings</p>
+                  <h2 className="mt-1 text-ink pb-3 border-b border-[var(--rule-strong)]">Branding</h2>
+                  <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5">
+                    <label className="field"><span>Watermark (eyebrow)</span><input value={watermarkText} onChange={(e) => setWatermarkText(e.target.value)} placeholder="THE MATCH SIGNAL" /></label>
+                    <label className="field"><span>Headline (serif lead)</span><input value={headlineText} onChange={(e) => setHeadlineText(e.target.value)} placeholder="Matchup banner" /></label>
+                    <label className="field"><span>Caption (bottom slab)</span><input value={captionText} onChange={(e) => setCaptionText(e.target.value)} placeholder="Tactical hook description" /></label>
+                    <label className="field"><span>Accent (gold pull-quote)</span><input value={accentText} onChange={(e) => setAccentText(e.target.value)} placeholder="Optional score / stat line" /></label>
+                  </div>
+
+                  {/* Aspect picker */}
+                  <div className="mt-7">
+                    <div className="flex items-baseline justify-between pb-2 border-b border-[var(--rule)]">
+                      <p className="eyebrow pitch">Aspects</p>
+                      <span className="caption">{aspectSelection.length} of {ALL_ASPECTS.length}</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-2">
+                      {ALL_ASPECTS.map((key) => {
+                        const labels: Record<AspectKey, string> = {
+                          "9x16": "9:16 vertical",
+                          "1x1": "1:1 square",
+                          "16x9": "16:9 horizontal",
+                          "4x5": "4:5 portrait",
+                        };
+                        const active = aspectSelection.includes(key);
+                        return (
+                          <button
+                            key={key}
+                            type="button"
+                            onClick={() => toggleAspect(key)}
+                            className={`text-left px-3 py-2 border transition-colors ${
+                              active
+                                ? "border-[var(--ink)] bg-[var(--paper-raised)] text-ink"
+                                : "border-[var(--rule)] text-[var(--ink-muted)] hover:border-[var(--ink-muted)]"
+                            }`}
+                          >
+                            <span className="figure block text-[0.95rem] tabular-nums">{key.replace("x", ":")}</span>
+                            <span className="caption block mt-0.5">{labels[key].split(" ").slice(1).join(" ")}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Render mode + crop */}
+                  <div className="mt-7 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5">
+                    <label className="field">
+                      <span>Render mode</span>
+                      <select value={renderMode} onChange={(event) => setRenderMode(event.target.value as "rough" | "final")}>
+                        <option value="final">Final · multi-aspect, ASS subs, 2-pass loudnorm</option>
+                        <option value="rough">Rough fast cut · stream copy</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Crop mode</span>
+                      <select value={cropMode} onChange={(event) => setCropMode(event.target.value as "fill" | "fit")}>
+                        <option value="fill">Fill (centre crop)</option>
+                        <option value="fit">Fit (letterbox to ink)</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {/* Transcript / Whisper row */}
+                  <div className="mt-5 flex flex-wrap items-baseline justify-between gap-3 pb-2 border-b border-[var(--rule)]">
+                    <div>
+                      <p className="eyebrow pitch">Transcript</p>
+                      <span className="caption">
+                        {whisperConfigured === null
+                          ? "Whisper status unknown — run engine check"
+                          : whisperConfigured
+                          ? `Whisper ready · ${transcriptCues.length} cue${transcriptCues.length === 1 ? "" : "s"} loaded`
+                          : "Whisper model missing — download ggml-small.en.bin into ./models/"}
+                      </span>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="secondary"
+                        icon={<Mic size={13} />}
+                        onClick={() => selectedClip && transcribeClip(selectedClip)}
+                        loading={loading.transcribe}
+                        disabled={!selectedClip}
+                      >
+                        Transcribe selected clip
+                      </Button>
+                      {transcriptCues.length > 0 && (
+                        <Button variant="ghost" icon={<Trash2 size={12} />} onClick={() => setTranscriptCues([])}>
+                          Clear cues
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+
+                  <label className="mt-5 flex items-center gap-2 text-[0.875rem] text-[var(--ink-muted)] cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      id="gpu-accel"
+                      checked={gpuAcceleration}
+                      onChange={(e) => setGpuAcceleration(e.target.checked)}
+                      className="h-4 w-4 cursor-pointer"
+                      style={{ accentColor: "var(--ink)" }}
+                    />
+                    Use GPU hardware acceleration (NVENC / AMF, falls back to libx264 if the chain refuses)
+                  </label>
+                </div>
+
+                <div>
+                  <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                    <div>
+                      <p className="eyebrow pitch">Clip plans</p>
+                      <h2 className="mt-1 text-ink">Suggested cuts</h2>
+                    </div>
+                    <span className="caption">{clipPlans.length} plans</span>
+                  </div>
+                  <div className="clip-plan-list">
+                    {clipPlans.map((clip) => (
+                      <article
+                        className={`clip-plan-card ${selectedClip?.id === clip.id ? "active" : ""}`}
+                        key={clip.id}
+                        onClick={() => setSelectedClipId(clip.id)}
+                      >
+                        <div className="clip-plan-heading">
+                          <div>
+                            <p className="eyebrow pitch">{clip.preset}</p>
+                            <h3>{clip.title}</h3>
+                          </div>
+                          <strong>{clip.duration}s</strong>
+                        </div>
+                        <p className="clip-hook">{clip.hook}</p>
+                        <p>{clip.treatment}</p>
+                        <div className="clip-meta-row">
+                          <span>{clip.startTime}s – {clip.endTime}s</span>
+                          <span>{clip.platforms.join(" · ")}</span>
+                        </div>
+                        <Button
+                          variant="primary"
+                          icon={<Scissors size={13} />}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void renderClip(clip);
+                          }}
+                          loading={renderingClipId === clip.id}
+                        >
+                          {renderingClipId === clip.id ? "Rendering" : "Render"}
+                        </Button>
+                      </article>
+                    ))}
+                    {clipPlans.length === 0 && (
+                      <p className="text-[var(--ink-muted)] py-6">No plans yet — set a source and probe to generate clip suggestions.</p>
+                    )}
+                  </div>
+                </div>
+              </article>
+
+              {/* Right column: output queue */}
+              <aside className="min-w-0">
+                <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                  <div>
+                    <p className="eyebrow pitch">Rendered clips</p>
+                    <h2 className="mt-1 text-ink">Output queue</h2>
+                  </div>
+                  <div className="flex gap-2">
+                    {selectedJobsToMerge.length >= 2 && (
+                      <Button variant="primary" icon={<Layers size={13} />} onClick={mergeClips} loading={loading.mergeClips}>
+                        Merge ({selectedJobsToMerge.length})
+                      </Button>
+                    )}
+                    <Button variant="danger" icon={<Trash2 size={13} />} onClick={() => { setRenderJobs([]); setSelectedJobsToMerge([]); }}>
+                      Clear
                     </Button>
                   </div>
                 </div>
-              )}
+                {renderJobs.length ? (
+                  <div className="render-list">
+                    {renderJobs.map((job) => {
+                      const dims = job.width && job.height ? `${job.width}×${job.height}` : null;
+                      const aspectLabel = job.aspect && job.aspect !== "source"
+                        ? job.aspect.replace("x", ":")
+                        : "source";
+                      return (
+                        <article className="render-card relative" key={job.id}>
+                          <video controls src={job.publicUrl} />
+                          <div>
+                            <div className="flex items-start justify-between gap-3">
+                              <h3 className="text-[0.95rem]">{job.title}</h3>
+                              <input
+                                type="checkbox"
+                                checked={selectedJobsToMerge.includes(job.publicUrl)}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedJobsToMerge([...selectedJobsToMerge, job.publicUrl]);
+                                  } else {
+                                    setSelectedJobsToMerge(selectedJobsToMerge.filter((p) => p !== job.publicUrl));
+                                  }
+                                }}
+                                className="h-4 w-4 cursor-pointer mt-1"
+                                style={{ accentColor: "var(--ink)" }}
+                              />
+                            </div>
+                            <p className="caption">
+                              <span className="figure text-ink tabular-nums">{aspectLabel}</span>
+                              {dims ? ` · ${dims}` : ""}
+                              {" · "}{job.mode} · {job.cropMode} · {Math.round(job.duration)}s
+                              {job.encoder ? ` · ${job.encoder}` : ""}
+                              {job.gpuFallback ? " · GPU→CPU fallback" : ""}
+                            </p>
+                            <a href={job.publicUrl} target="_blank" rel="noreferrer">Open clip</a>
+                            {job.command && (
+                              <Button variant="ghost" icon={<Clipboard size={12} />} onClick={() => copy("Render Command", job.command!.join(" "))}>
+                                Copy command
+                              </Button>
+                            )}
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="mt-5 text-[var(--ink-muted)] max-w-[44ch]">
+                    Rendered clips will appear here, one per aspect ratio. Pick aspects, set a source path, and render a plan.
+                  </p>
+                )}
+              </aside>
+            </section>
+          </section>
+        )}
 
-              {/* Text Overlays and GPU Settings */}
-              <div className="bg-paper-2/45 border border-line-border/35 rounded-none p-4 flex flex-col gap-3">
-                <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider block border-b border-line-border/20 pb-1.5 font-mono">
-                  Advanced Overlays & Render Settings
-                </span>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <label className="flex flex-col gap-1 w-full">
-                    <span className="text-[10px] text-muted-text uppercase font-extrabold tracking-wider">Watermark text</span>
-                    <input
-                      value={watermarkText}
-                      onChange={(e) => setWatermarkText(e.target.value)}
-                      placeholder="THE MATCH SIGNAL"
-                      className="bg-field border border-line-border/60 rounded-none h-9 px-2.5 text-xs text-ink focus:border-pitch-green focus:outline-none"
-                    />
-                  </label>
-                  <label className="flex flex-col gap-1 w-full">
-                    <span className="text-[10px] text-muted-text uppercase font-extrabold tracking-wider">Headline text</span>
-                    <input
-                      value={headlineText}
-                      onChange={(e) => setHeadlineText(e.target.value)}
-                      placeholder="Matchup banner"
-                      className="bg-field border border-line-border/60 rounded-none h-9 px-2.5 text-xs text-ink focus:border-pitch-green focus:outline-none"
-                    />
-                  </label>
-                  <label className="flex flex-col gap-1 w-full">
-                    <span className="text-[10px] text-muted-text uppercase font-extrabold tracking-wider">Caption text</span>
-                    <input
-                      value={captionText}
-                      onChange={(e) => setCaptionText(e.target.value)}
-                      placeholder="Tactical hook description"
-                      className="bg-field border border-line-border/60 rounded-none h-9 px-2.5 text-xs text-ink focus:border-pitch-green focus:outline-none"
-                    />
-                  </label>
-                </div>
-                <div className="flex items-center gap-2 mt-1">
-                  <input
-                    type="checkbox"
-                    id="gpu-accel"
-                    checked={gpuAcceleration}
-                    onChange={(e) => setGpuAcceleration(e.target.checked)}
-                    className="h-4 w-4 rounded border-line-border/50 text-pitch-green focus:ring-pitch-green cursor-pointer"
-                  />
-                  <label htmlFor="gpu-accel" className="text-xs font-bold text-slate-700 dark:text-muted-text cursor-pointer select-none">
-                    Use GPU Hardware Acceleration (NVENC / AMF)
-                  </label>
-                </div>
+        {activeView === "review" && (
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-12 gap-y-6">
+              <div>
+                <p className="eyebrow gold">Operator Review · {selectedFixture.teamA} vs {selectedFixture.teamB}</p>
+                <h1 className="mt-3 text-ink">Approve the signal before it leaves the room.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Review safety notes, mark outcomes, and feed post-match lessons back into the intelligence loop.
+                </p>
+                <div className="hr-gold mt-4" />
               </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <label className="flex flex-col gap-1.5 w-full">
-                  <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider">Render mode</span>
-                  <select
-                    value={renderMode}
-                    onChange={(event) => setRenderMode(event.target.value as "rough" | "final")}
-                    className="w-full bg-field-bg border border-line-border/60 rounded-none h-10 px-3.5 text-sm text-ink focus:border-pitch-green focus:outline-none focus:ring-2 focus:ring-pitch-green/20 transition-all duration-200"
-                  >
-                    <option value="final">Final vertical render</option>
-                    <option value="rough">Rough fast cut</option>
-                  </select>
-                </label>
-                <label className="flex flex-col gap-1.5 w-full">
-                  <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider">Crop mode</span>
-                  <select
-                    value={cropMode}
-                    onChange={(event) => setCropMode(event.target.value as "fill" | "fit")}
-                    className="w-full bg-field-bg border border-line-border/60 rounded-none h-10 px-3.5 text-sm text-ink focus:border-pitch-green focus:outline-none focus:ring-2 focus:ring-pitch-green/20 transition-all duration-200"
-                  >
-                    <option value="fill">Fill 9:16</option>
-                    <option value="fit">Fit with padding</option>
-                  </select>
-                </label>
+              <div className="lg:self-end flex flex-col gap-2">
+                <Button variant="primary" icon={<ShieldCheck size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Approved" })}>
+                  Approve match
+                </Button>
+                <Button variant="secondary" icon={<RefreshCcw size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Draft" })}>
+                  Return to draft
+                </Button>
+                <Button variant="secondary" icon={<Sparkles size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Posted" })}>
+                  Mark posted
+                </Button>
               </div>
+            </header>
 
-              <div className="flex flex-col gap-3.5 mt-2">
-                {clipPlans.map((clip) => (
-                  <article
-                    className={`bg-paper-2 border rounded-none p-4 flex flex-col gap-3 hover:border-line-border transition-all duration-300 cursor-pointer  ${
-                      selectedClip?.id === clip.id ? "border-signal-gold shadow-[0_0_15px_rgba(251,191,36,0.08)] bg-signal-gold/5" : "border-line-border/30"
-                    }`}
-                    key={clip.id}
-                    onClick={() => setSelectedClipId(clip.id)}
-                  >
-                    <div className="flex justify-between items-start w-full">
-                      <div>
-                        <p className="text-pitch-green text-[9px] font-extrabold uppercase tracking-wider mb-0.5">{clip.preset}</p>
-                        <h3 className="text-slate-900 dark:text-ink text-sm font-bold tracking-tight">{clip.title}</h3>
-                      </div>
-                      <span className="bg-paper-2 border border-line-border/30 text-muted-text text-xs font-bold px-2 py-0.5 rounded-none font-mono">
-                        {clip.duration}s
-                      </span>
-                    </div>
-                    <p className="text-pitch-green font-bold text-xs">{clip.hook}</p>
-                    <p className="text-xs text-slate-700 dark:text-muted-text leading-relaxed">{clip.treatment}</p>
-                    <div className="flex justify-between items-center mt-1 pt-2 border-t border-line-border/20 text-[10px] text-muted-text font-semibold">
-                      <span>{clip.startTime}s - {clip.endTime}s</span>
-                      <span>{clip.platforms.join(" / ")}</span>
-                    </div>
-                    <Button
-                      variant="glass"
-                      icon={<Scissors size={14} />}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void renderClip(clip);
-                      }}
-                      loading={renderingClipId === clip.id}
-                      className="mt-2 text-xs h-8"
-                    >
-                      {renderingClipId === clip.id ? "Rendering" : "Render"}
-                    </Button>
-                  </article>
-                ))}
-              </div>
-            </article>
-
-            <article className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4">
-              <div className="flex justify-between items-center border-b border-line-border/30 pb-3">
+            {/* Safety checker */}
+            <section>
+              <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
                 <div>
-                  <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-0.5">Rendered Clips</p>
-                  <h2 className="text-slate-900 dark:text-ink text-base md:text-lg font-black tracking-tight">Output Queue</h2>
+                  <p className="eyebrow pitch">Safety checker</p>
+                  <h2 className="mt-1 text-ink">Pre-publish guard</h2>
                 </div>
-                <div className="flex gap-2">
-                  {selectedJobsToMerge.length >= 2 && (
-                    <Button
-                      variant="primary"
-                      icon={<Layers size={14} />}
-                      onClick={mergeClips}
-                      loading={loading.mergeClips}
-                      className="h-8 text-xs text-[#060913]"
-                    >
-                      Merge ({selectedJobsToMerge.length})
-                    </Button>
-                  )}
-                  <Button variant="glass" icon={<Trash2 size={14} />} onClick={() => { setRenderJobs([]); setSelectedJobsToMerge([]); }} className="h-8 text-xs text-pressure-red hover:bg-pressure-red/5 hover:border-pressure-red/25">
-                    Clear
-                  </Button>
-                </div>
+                <span className="caption">{content.safetyNotes.length} note{content.safetyNotes.length === 1 ? "" : "s"}</span>
               </div>
-              {renderJobs.length ? (
-                <div className="flex flex-col gap-4 mt-2">
-                  {renderJobs.map((job) => (
-                    <article className="bg-paper-2 border border-line-border/35 rounded-none p-4 grid grid-cols-[124px_1fr] gap-4  hover:border-line-border transition-colors duration-300 relative" key={job.id}>
-                      <div className="absolute top-3 right-3 z-10">
-                        <input
-                          type="checkbox"
-                          checked={selectedJobsToMerge.includes(job.publicUrl)}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setSelectedJobsToMerge([...selectedJobsToMerge, job.publicUrl]);
-                            } else {
-                              setSelectedJobsToMerge(selectedJobsToMerge.filter((p) => p !== job.publicUrl));
-                            }
-                          }}
-                          className="h-4.5 w-4.5 rounded border-line-border/60 text-pitch-green focus:ring-pitch-green cursor-pointer"
-                        />
+              <ol className="mt-5 grid gap-0 border-t border-[var(--rule)]">
+                {content.safetyNotes.map((note, i) => (
+                  <li key={note} className="grid grid-cols-[40px_minmax(0,1fr)] py-4 border-b border-[var(--rule)] border-l-2 border-l-[var(--gold)] pl-3 text-[0.95rem] leading-[1.55] text-[var(--ink-muted)]">
+                    <span className="figure text-[1.1rem] text-[var(--ink-quiet)]">{String(i + 1).padStart(2, "0")}</span>
+                    <span className="text-ink">{note}</span>
+                  </li>
+                ))}
+              </ol>
+              <Button variant="danger" icon={<Trash2 size={14} />} onClick={() => setFixtures(fixtures.filter((fixture) => fixture.id !== selectedFixture.id))} className="mt-5">
+                Remove fixture
+              </Button>
+            </section>
+
+            {/* Learning loop */}
+            <section>
+              <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow pitch">Analytics agent</p>
+                  <h2 className="mt-1 text-ink">Learning loop</h2>
+                </div>
+                <span className="caption">model read rate · {accuracyRate}</span>
+              </div>
+
+              <section className="signal-meters border-y border-[var(--rule)] mt-5">
+                <Metric label="Prediction coverage" value={`${fixtures.length}/${fixtures.length}`} />
+                <Metric label="Queued videos" value={String(fixtures.length)} />
+                <Metric label="Model read rate" value={accuracyRate} />
+                <Metric label="Reviewed matches" value={`${completedRecords}/${fixtures.length}`} />
+              </section>
+
+              <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-x-8 gap-y-5">
+                <LabeledInput label="Final score" value={selectedAccuracy.finalScore} onChange={(finalScore) => updateAccuracy({ finalScore })} />
+                <LabeledInput label="Actual winner" value={selectedAccuracy.actualWinner} onChange={(actualWinner) => updateAccuracy({ actualWinner })} />
+                <label className="field">
+                  <span>Model read</span>
+                  <select
+                    value={selectedAccuracy.modelRead}
+                    onChange={(event) => updateAccuracy({ modelRead: event.target.value as AccuracyRecord["modelRead"] })}
+                  >
+                    <option>Pending</option>
+                    <option>Right</option>
+                    <option>Partial</option>
+                    <option>Wrong</option>
+                  </select>
+                </label>
+                <label className="field md:col-span-3">
+                  <span>Post-match lesson</span>
+                  <textarea
+                    value={selectedAccuracy.lesson}
+                    onChange={(event) => updateAccuracy({ lesson: event.target.value })}
+                    placeholder="What did the model learn from the match?"
+                  />
+                </label>
+              </div>
+              <p className="mt-4 max-w-[68ch] text-[0.875rem] leading-[1.55] text-[var(--ink-muted)]">
+                This view tracks football-intelligence outcomes and content priority. The next engineering move is wiring these records to Supabase or Google Sheets, then letting n8n trigger Telegram previews and Remotion renders.
+              </p>
+            </section>
+          </section>
+        )}
+
+        {activeView === "vip" && (
+          <section className="flex flex-col gap-12">
+            {/* Masthead */}
+            <header className="border-t-2 border-ink pt-7 grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-12 gap-y-6">
+              <div>
+                <p className="eyebrow gold">VIP Desk — gated picks layer</p>
+                <h1 className="mt-3 text-ink">Value picks, sober delivery.</h1>
+                <p className="mt-5 max-w-[58ch] text-[1rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Picks are computed server-side from team-rating model probability and current book prices: fractional Kelly stake (0.25×, capped 2u), minimum +4% EV, responsible-gambling footer auto-appended. Only published to the private VIP channel — never public Telegram, never social.
+                </p>
+                <div className="hr-gold mt-4" />
+              </div>
+              <div className="lg:self-end flex flex-col gap-2">
+                <Button variant="secondary" icon={<RefreshCcw size={14} />} onClick={() => void previewVipPicks()} loading={loading.previewVipPicks}>
+                  Recompute picks
+                </Button>
+                <Button
+                  variant="primary"
+                  icon={<Send size={14} />}
+                  onClick={sendTelegramVip}
+                  loading={loading.sendTelegramVip}
+                  disabled={!vipPublishEnabled || vipPicks.length === 0}
+                >
+                  Send to VIP channel
+                </Button>
+              </div>
+            </header>
+
+            {/* Scope banner — non-dismissible */}
+            <section
+              className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-10 gap-y-3 py-5 border-y"
+              style={{ borderColor: "var(--rule-strong)", background: "var(--paper-raised)" }}
+            >
+              <div>
+                <p className="eyebrow gold">VIP scope</p>
+                <p className="mt-1 text-[0.92rem] leading-[1.55] text-ink max-w-[58ch]">
+                  Audience: opt-in subscribers in jurisdictions where sports-wagering content is permitted. 18+ / 21+ where required. No public re-broadcast of any pick or odds line.
+                </p>
+              </div>
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                <dt className="caption">Channel configured</dt>
+                <dd className="text-ink">{vipPublishEnabled ? "Yes" : "No"}</dd>
+                <dt className="caption">Jurisdictions</dt>
+                <dd className="text-ink">{vipJurisdictions.length ? vipJurisdictions.join(", ") : "—"}</dd>
+                <dt className="caption">Fixture</dt>
+                <dd className="text-ink truncate">{selectedFixture.teamA} vs {selectedFixture.teamB}</dd>
+                <dt className="caption">Open picks</dt>
+                <dd className="text-ink">{vipPicks.length}</dd>
+              </dl>
+            </section>
+
+            {/* Picks list */}
+            <section>
+              <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow pitch">Open value picks</p>
+                  <h2 className="mt-1 text-ink">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
+                </div>
+                <span className="caption">
+                  {selectedFixture.homeOdds ? `Home ${Number(selectedFixture.homeOdds).toFixed(2)}` : "Home —"}
+                  {" · "}
+                  {selectedFixture.drawOdds ? `Draw ${Number(selectedFixture.drawOdds).toFixed(2)}` : "Draw —"}
+                  {" · "}
+                  {selectedFixture.awayOdds ? `Away ${Number(selectedFixture.awayOdds).toFixed(2)}` : "Away —"}
+                </span>
+              </div>
+              {vipPicks.length === 0 ? (
+                <p className="mt-5 max-w-[60ch] text-[var(--ink-muted)]">
+                  No value picks at current prices. Either the book has the line right (no edge), or odds haven't been loaded yet. Use the Market Feed action in Command to pull current prices, then recompute.
+                </p>
+              ) : (
+                <div className="mt-2 grid gap-0 border-t border-[var(--rule)]">
+                  {vipPicks.map((pick) => (
+                    <article key={pick.id} className="grid grid-cols-[56px_minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1fr)] gap-x-6 py-5 border-b border-[var(--rule)] items-baseline">
+                      <span className="figure text-[1.6rem] leading-none text-ink">{(pick.ev * 100).toFixed(1)}<span className="text-[var(--ink-quiet)] text-[0.7rem]">%EV</span></span>
+                      <div>
+                        <h3 className="text-ink font-display [font-variation-settings:'opsz'_60] font-medium text-[1.05rem] tracking-[-0.015em]">
+                          {pick.market} · {pick.side}
+                          <span className="text-[var(--ink-quiet)] font-normal italic font-display ml-2">({pick.label})</span>
+                        </h3>
+                        <p className="caption mt-1">{pick.bookName} @ <span className="figure">{pick.bookPrice.toFixed(2)}</span></p>
                       </div>
-                      <video controls src={job.publicUrl} className="aspect-[9/16] bg-[#060913] border border-line-border/30 rounded-none w-full h-[220px] object-cover" />
-                      <div className="flex flex-col justify-between py-1">
-                        <div className="flex flex-col gap-1 pr-6">
-                          <h3 className="text-slate-900 dark:text-ink text-xs font-bold tracking-tight leading-snug">{job.title}</h3>
-                          <p className="text-[10px] text-muted-text font-bold uppercase tracking-wider mt-0.5">{job.mode} · {job.cropMode} · {Math.round(job.duration)}s</p>
-                        </div>
-                        <div className="flex flex-col gap-2 mt-2">
-                          <a href={job.publicUrl} target="_blank" rel="noreferrer" className="text-pitch-green hover:underline text-xs font-semibold">Open clip</a>
-                          <Button variant="glass" icon={<Clipboard size={12} />} onClick={() => copy("Render Command", job.command.join(" "))} className="h-7 text-[10px]">
-                            Copy command
-                          </Button>
-                        </div>
+                      <div>
+                        <p className="caption">Model vs implied</p>
+                        <p className="mt-1 text-ink"><span className="figure">{(pick.modelProb * 100).toFixed(1)}%</span> <span className="text-[var(--ink-quiet)]">/ {(pick.impliedProb * 100).toFixed(1)}%</span></p>
+                      </div>
+                      <div>
+                        <p className="caption">Stake · confidence</p>
+                        <p className="mt-1 text-ink"><span className="figure">{pick.stakeUnits.toFixed(2)}u</span> <span className="text-[var(--ink-quiet)]">· {pick.confidence}</span></p>
                       </div>
                     </article>
                   ))}
                 </div>
+              )}
+            </section>
+
+            {/* VIP message preview */}
+            <section>
+              <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow pitch">VIP channel preview</p>
+                  <h2 className="mt-1 text-ink">Exact text that will be sent</h2>
+                </div>
+                {vipMessage && (
+                  <Button variant="ghost" icon={<Clipboard size={13} />} onClick={() => copy("VIP", vipMessage)}>
+                    {copied === "VIP" ? "Copied" : "Copy"}
+                  </Button>
+                )}
+              </div>
+              {vipMessage ? (
+                <pre className="mt-4 max-h-[420px]">{vipMessage}</pre>
               ) : (
-                <p className="text-xs text-muted-text leading-relaxed">
-                  Rendered vertical clips will appear here. Add a source video path, choose a planned clip, and render the first cut.
+                <p className="mt-5 max-w-[60ch] text-[var(--ink-muted)]">
+                  Nothing to preview yet. Picks must exist before a message is built.
                 </p>
               )}
-            </article>
-          </section>
-        )}
+            </section>
 
-        {(activeView === "automation" || activeView === "review") && (
-          <section className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-            {activeView === "automation" && (
-              <div className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4">
-                <div className="flex justify-between items-center border-b border-line-border/30 pb-3">
-                  <div>
-                    <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-0.5">Remotion Video Engine</p>
-                    <h2 className="text-slate-900 dark:text-ink text-base md:text-lg font-black tracking-tight">Render JSON</h2>
-                  </div>
-                  <Button variant="glass" icon={<Clipboard size={14} />} onClick={() => copy("Video JSON", JSON.stringify(videoJson, null, 2))} className="h-8 text-xs">
-                    {copied === "Video JSON" ? "Copied" : "Copy JSON"}
-                  </Button>
-                </div>
-                <pre className="bg-[#090f1e]/90 border border-line-border/30 rounded-none p-4 text-xs font-mono text-ink overflow-auto max-h-[360px]">{JSON.stringify(videoJson, null, 2)}</pre>
-              </div>
-            )}
-
-            {activeView === "review" && (
-              <article className="border border-[#d0b36a]/25 bg-[#101b17] p-6 md:p-8 text-[#f6efe0] lg:col-span-2">
-                <p className="text-[10px] font-black uppercase tracking-[0.28em] text-[#c9972d]">Operator Review</p>
-                <div className="mt-5 grid gap-6 lg:grid-cols-[1fr_360px] lg:items-end">
-                  <div>
-                    <h2 className="text-[clamp(2rem,4.4vw,4.6rem)] font-black leading-[0.92] tracking-[-0.055em]">
-                      Approve the signal before it leaves the room.
-                    </h2>
-                    <p className="mt-5 max-w-[720px] text-base leading-7 text-[#d9d0bd]">
-                      Review safety notes, mark outcomes, and feed post-match lessons back into the intelligence loop.
-                    </p>
-                  </div>
-                  <div className="grid gap-3 border border-[#f6efe0]/10 bg-[#f6efe0]/5 p-4">
-                    <Button variant="primary" icon={<ShieldCheck size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Approved" })}>
-                      Approve match
-                    </Button>
-                    <Button variant="glass" icon={<RefreshCcw size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Draft" })}>
-                      Return to draft
-                    </Button>
-                    <Button variant="glass" icon={<Sparkles size={14} />} onClick={() => updateFixture(selectedFixture.id, { contentStatus: "Posted" })}>
-                      Mark posted
-                    </Button>
-                  </div>
-                </div>
-              </article>
-            )}
-
-            {activeView === "review" && (
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="border-b border-line-border/35 pb-4">
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Safety Checker</p>
-                  <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">{selectedFixture.teamA} vs {selectedFixture.teamB}</h2>
-                </div>
-                <div className="mt-5 grid gap-3">
-                  {content.safetyNotes.map((note) => (
-                    <div key={note} className="border-l border-signal-gold/45 bg-field-bg/55 p-3 pl-4 text-sm leading-6 text-muted-text">
-                      {note}
-                    </div>
-                  ))}
-                </div>
-                <Button variant="danger" icon={<Trash2 size={14} />} onClick={() => setFixtures(fixtures.filter((fixture) => fixture.id !== selectedFixture.id))} className="mt-5 w-full text-xs">
-                  Remove fixture
-                </Button>
-              </article>
-            )}
-
-            {activeView === "review" && (
-              <article className="border border-line-border/45 bg-paper p-5 md:p-6">
-                <div className="border-b border-line-border/35 pb-4">
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-signal-gold">Analytics Agent</p>
-                  <h2 className="mt-1 text-xl font-black tracking-[-0.04em] text-ink">Learning Loop</h2>
-                </div>
-                <div className="mt-5 grid grid-cols-2 gap-3">
-                  <Metric label="Prediction coverage" value={`${fixtures.length}/${fixtures.length}`} />
-                  <Metric label="Queued videos" value={String(fixtures.length)} />
-                  <Metric label="Model read rate" value={accuracyRate} />
-                  <Metric label="Reviewed matches" value={`${completedRecords}/${fixtures.length}`} />
-                </div>
-                <div className="mt-5 grid grid-cols-1 gap-4 border border-line-border/35 bg-field-bg/55 p-4 md:grid-cols-3">
-                  <LabeledInput label="Final score" value={selectedAccuracy.finalScore} onChange={(finalScore) => updateAccuracy({ finalScore })} />
-                  <LabeledInput label="Actual winner" value={selectedAccuracy.actualWinner} onChange={(actualWinner) => updateAccuracy({ actualWinner })} />
-                  <label className="flex flex-col gap-1.5 w-full">
-                    <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider">Model read</span>
-                    <select
-                      value={selectedAccuracy.modelRead}
-                      onChange={(event) => updateAccuracy({ modelRead: event.target.value as AccuracyRecord["modelRead"] })}
-                      className="w-full bg-field-bg border border-line-border/60 rounded-none h-10 px-3.5 text-sm text-ink focus:border-pitch-green focus:outline-none focus:ring-2 focus:ring-pitch-green/20 transition-all duration-200"
-                    >
-                      <option>Pending</option>
-                      <option>Right</option>
-                      <option>Partial</option>
-                      <option>Wrong</option>
-                    </select>
-                  </label>
-                  <label className="flex flex-col gap-1.5 w-full md:col-span-3">
-                    <span className="text-muted-text text-[10px] font-extrabold uppercase tracking-wider">Post-match lesson</span>
-                    <textarea
-                      value={selectedAccuracy.lesson}
-                      onChange={(event) => updateAccuracy({ lesson: event.target.value })}
-                      placeholder="What did the model learn from the match?"
-                      className="w-full bg-field-bg/85 border border-line-border/60 hover:border-line-border rounded-none min-h-[96px] resize-y p-3 text-sm text-ink focus:border-pitch-green focus:outline-none focus:ring-2 focus:ring-pitch-green/20 transition-all duration-200 font-sans"
-                    />
-                  </label>
-                </div>
-                <p className="text-xs text-muted-text leading-relaxed mt-2">
-                  This upgrade tracks football-intelligence outcomes and content priority. The next engineering move is wiring these records to Supabase or Google Sheets, then letting n8n trigger Telegram previews and Remotion renders.
+            {/* Operator notes */}
+            <section className="grid grid-cols-1 md:grid-cols-3 gap-x-10 gap-y-4 py-5 border-y border-[var(--rule)]">
+              <div>
+                <p className="eyebrow pitch">Public surfaces</p>
+                <p className="mt-2 text-[0.92rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Editorial Telegram, public channel, and social pass through a server-side safety filter. Any pick/odds/EV/book token gets rejected with HTTP 422.
                 </p>
-              </article>
-            )}
+              </div>
+              <div>
+                <p className="eyebrow pitch">Stake discipline</p>
+                <p className="mt-2 text-[0.92rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Stake = 0.25 × full Kelly, capped at 2u, floor 0.25u. Anything below the floor publishes as zero — the channel stays small and disciplined.
+                </p>
+              </div>
+              <div>
+                <p className="eyebrow pitch">Audit trail</p>
+                <p className="mt-2 text-[0.92rem] leading-[1.55] text-[var(--ink-muted)]">
+                  Every published pick writes a row to <span className="font-mono text-ink">pick_log</span> in Supabase (best-effort): market, side, model prob, book price, EV, stake, timestamp. Used later for closing-line value tracking.
+                </p>
+              </div>
+            </section>
           </section>
         )}
       </section>

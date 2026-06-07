@@ -1,7 +1,6 @@
 import React from "react";
 import { CalendarPlus, Layers, BarChart3 } from "lucide-react";
 import { Fixture, StandingGroup } from "../types";
-import { Metric } from "./Metric";
 import { Button } from "./ui/Button";
 
 type WorldCupDataViewProps = {
@@ -76,6 +75,22 @@ const buildGroupTables = (fixtures: Fixture[]) => {
   );
 };
 
+const sourceLabel = (fixture: Fixture) => {
+  if (fixture.id.startsWith("fd-") && fixture.sourceId) return "Dual";
+  if (fixture.id.startsWith("fd-")) return "Football-data";
+  if (fixture.sourceId) return "Sportradar";
+  return "Local";
+};
+
+type StatProps = { label: string; value: string | number; note?: string };
+const Stat = ({ label, value, note }: StatProps) => (
+  <div className="flex flex-col gap-1.5 py-5 pr-6 border-r last:border-r-0 border-[var(--rule)]">
+    <span className="caption">{label}</span>
+    <span className="figure text-[clamp(1.6rem,2.4vw,2.2rem)] text-ink leading-none">{value}</span>
+    {note && <span className="text-[0.75rem] text-[var(--ink-quiet)] tracking-[0.02em]">{note}</span>}
+  </div>
+);
+
 export function WorldCupDataView({
   fixtures,
   selectedId,
@@ -99,269 +114,322 @@ export function WorldCupDataView({
       }));
   const byGroup = groupFixturesBy(displayFixtures, groupNameFor);
   const byMatchday = groupFixturesBy(displayFixtures, matchdayFor);
-  const groupFixtureCount = displayFixtures.filter((fixture) => groupNameFor(fixture).startsWith("GROUP_")).length;
+  const groupFixtureCount = displayFixtures.filter((fixture) =>
+    groupNameFor(fixture).startsWith("GROUP_"),
+  ).length;
   const knockoutFixtureCount = displayFixtures.length - groupFixtureCount;
   const footballDataCount = displayFixtures.filter((fixture) => fixture.id.startsWith("fd-")).length;
-  const sportradarEnrichedCount = displayFixtures.filter((fixture) => fixture.sourceId?.startsWith("sr:")).length;
+  const sportradarEnrichedCount = displayFixtures.filter((fixture) =>
+    fixture.sourceId?.startsWith("sr:"),
+  ).length;
+  const standingsSource = standings.length ? "Official, via Sportradar" : "Generated locally";
 
   return (
-    <section className="flex flex-col gap-6">
-      <div className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-1">
-            World Cup 2026 Data
+    <section className="flex flex-col gap-12 pt-2">
+      {/* ===== Masthead ===== */}
+      <header className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)] gap-x-10 gap-y-6 pt-2 pb-7 border-t-2 border-ink">
+        <div className="flex flex-col gap-3 pt-5">
+          <p className="eyebrow gold">World Cup 2026 — The Data Desk</p>
+          <h1 className="text-ink">Tournament Schedule</h1>
+          <p className="text-[var(--ink-muted)] max-w-[58ch] text-[1rem] leading-[1.55] mt-1">
+            Live API fixtures from football-data.org and Sportradar, merged into one matchday queue
+            with group standings and content priorities. Selecting a row sets the active fixture
+            across every other view.
           </p>
-          <h2 className="text-ink text-xl font-black tracking-tight">Tournament Schedule</h2>
-          <p className="text-sm text-muted-text max-w-xl mt-1 leading-relaxed">
-            Live API fixtures are converted into match queues, group standings, content priorities, and prediction workflows.
-          </p>
+          <div className="hr-gold mt-3" />
         </div>
-        <div className="flex flex-wrap gap-2.5">
-          <Button
-            variant="glass"
-            icon={<CalendarPlus size={15} />}
-            onClick={onImport}
-            loading={loadingStates.importFixtures}
-          >
-            Football-data sync
-          </Button>
-          <Button
-            variant="glass"
-            icon={<Layers size={15} />}
-            onClick={onDualSync}
-            loading={loadingStates.syncWorldCup}
-          >
-            Dual-source sync
-          </Button>
-          <Button
-            variant="glass"
-            icon={<BarChart3 size={15} />}
-            onClick={onLoadStandings}
-            loading={loadingStates.standings}
-          >
-            Official standings
-          </Button>
+        <div className="flex flex-col gap-3 lg:items-end lg:justify-end lg:pt-5">
+          <span className="caption text-[var(--ink-quiet)]">Sync sources</span>
+          <div className="flex flex-wrap lg:justify-end gap-2">
+            <Button
+              variant="secondary"
+              icon={<CalendarPlus size={14} />}
+              onClick={onImport}
+              loading={loadingStates.importFixtures}
+            >
+              Football-data
+            </Button>
+            <Button
+              variant="secondary"
+              icon={<Layers size={14} />}
+              onClick={onDualSync}
+              loading={loadingStates.syncWorldCup}
+            >
+              Dual-source
+            </Button>
+            <Button
+              variant="secondary"
+              icon={<BarChart3 size={14} />}
+              onClick={onLoadStandings}
+              loading={loadingStates.standings}
+            >
+              Official standings
+            </Button>
+          </div>
         </div>
-      </div>
+      </header>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <Metric label="Matches loaded" value={String(displayFixtures.length)} />
-        <Metric label="Football-data rows" value={String(footballDataCount)} />
-        <Metric label="Sportradar IDs" value={String(sportradarEnrichedCount)} />
-        <Metric label="Group fixtures" value={String(groupFixtureCount)} />
-        <Metric label="Knockout fixtures" value={String(knockoutFixtureCount)} />
-        <Metric label="Official groups" value={String(standings.length)} />
-      </div>
+      {/* ===== Stat strip ===== */}
+      <section
+        aria-label="Schedule statistics"
+        className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 border-y border-[var(--rule)]"
+      >
+        <Stat label="Matches loaded" value={displayFixtures.length} />
+        <Stat label="Football-data" value={footballDataCount} note="rows imported" />
+        <Stat label="Sportradar" value={sportradarEnrichedCount} note="event IDs" />
+        <Stat label="Group stage" value={groupFixtureCount} />
+        <Stat label="Knockouts" value={knockoutFixtureCount} />
+        <Stat label="Standings" value={standings.length} note={standingsSource} />
+      </section>
 
-      <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-        {tableGroups.map(({ group, rows }) => (
-          <article
-            className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4"
-            key={group}
-          >
-            <div className="flex justify-between items-baseline border-b border-line-border/30 pb-2.5">
-              <h2 className="text-ink font-black text-base md:text-lg tracking-tight">{group}</h2>
-              <small className="text-[10px] text-muted-text uppercase font-bold tracking-wider">
-                {standings.length ? "official" : "generated"} · {rows.length} teams
-              </small>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs md:text-sm">
+      {/* ===== Group standings ===== */}
+      <section className="flex flex-col gap-5">
+        <div className="flex items-baseline justify-between flex-wrap gap-2">
+          <div>
+            <p className="eyebrow pitch mb-1">Group Stage Standings</p>
+            <h2 className="text-ink">Tables, by group</h2>
+          </div>
+          <span className="caption text-[var(--ink-quiet)]">
+            {standings.length ? "Official · live" : "Generated · pre-tournament"}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-10 border-t border-[var(--rule)] pt-6">
+          {tableGroups.length === 0 && (
+            <p className="text-[var(--ink-muted)] col-span-full">
+              No groups loaded yet. Run a Football-data or Dual-source sync from the masthead to
+              populate the schedule.
+            </p>
+          )}
+          {tableGroups.map(({ group, rows }) => (
+            <article key={group} className="flex flex-col gap-3">
+              <div className="flex items-baseline justify-between pb-2 border-b border-[var(--rule-strong)]">
+                <h3 className="text-ink font-display text-[1.15rem] font-medium tracking-[-0.015em] [font-variation-settings:'opsz'_60]">
+                  {group}
+                </h3>
+                <span className="caption text-[var(--ink-quiet)]">{rows.length} teams</span>
+              </div>
+              <table className="w-full text-left">
                 <thead>
-                  <tr className="border-b border-line-border/40 text-[10px] text-muted-text font-bold uppercase tracking-wider">
-                    <th className="py-2 pr-2">#</th>
-                    <th className="py-2 pr-2">Team</th>
-                    <th className="py-2 pr-2">P</th>
-                    <th className="py-2 pr-2">W</th>
-                    <th className="py-2 pr-2">D</th>
-                    <th className="py-2 pr-2">L</th>
-                    <th className="py-2 pr-2">GD</th>
-                    <th className="py-2">Pts</th>
+                  <tr>
+                    <th className="!py-2 !pl-0 !pr-2 w-7">#</th>
+                    <th className="!py-2 !px-2">Team</th>
+                    <th className="!py-2 !px-2 text-right">P</th>
+                    <th className="!py-2 !px-2 text-right">W</th>
+                    <th className="!py-2 !px-2 text-right">D</th>
+                    <th className="!py-2 !px-2 text-right">L</th>
+                    <th className="!py-2 !px-2 text-right">GD</th>
+                    <th className="!py-2 !pl-2 !pr-0 text-right">Pts</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-line-border/10 text-ink">
+                <tbody>
                   {rows.map((row) => (
-                    <tr key={row.team} className="hover:bg-white/5 transition-colors duration-150">
-                      <td className="py-2.5 pr-2 font-mono font-bold text-pitch-green">{row.rank}</td>
-                      <td className="py-2.5 pr-2 font-semibold text-ink truncate max-w-[120px]">
-                        {row.team}
+                    <tr key={row.team} className="hover:!bg-[var(--paper-raised)]">
+                      <td className="!pl-0 !pr-2 text-[var(--ink-quiet)] tabular">{row.rank}</td>
+                      <td className="!px-2 text-ink font-medium">{row.team}</td>
+                      <td className="!px-2 text-right tabular text-[var(--ink-muted)]">{row.played}</td>
+                      <td className="!px-2 text-right tabular text-[var(--ink-muted)]">{row.wins}</td>
+                      <td className="!px-2 text-right tabular text-[var(--ink-muted)]">{row.draws}</td>
+                      <td className="!px-2 text-right tabular text-[var(--ink-muted)]">{row.losses}</td>
+                      <td className="!px-2 text-right tabular text-[var(--ink-muted)]">
+                        {row.goalDifference > 0 ? `+${row.goalDifference}` : row.goalDifference}
                       </td>
-                      <td className="py-2.5 pr-2 font-mono">{row.played}</td>
-                      <td className="py-2.5 pr-2 font-mono">{row.wins}</td>
-                      <td className="py-2.5 pr-2 font-mono">{row.draws}</td>
-                      <td className="py-2.5 pr-2 font-mono">{row.losses}</td>
-                      <td className="py-2.5 pr-2 font-mono text-muted-text">{row.goalDifference}</td>
-                      <td className="py-2.5 font-bold font-mono text-pitch-green">{row.points}</td>
+                      <td className="!pl-2 !pr-0 text-right tabular text-ink font-semibold">{row.points}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            </div>
-          </article>
-        ))}
+            </article>
+          ))}
+        </div>
       </section>
 
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        <article className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4 lg:col-span-2">
-          <div className="border-b border-line-border/30 pb-3">
-            <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-0.5">
-              All Matches
-            </p>
-            <h2 className="text-ink text-base md:text-lg font-black tracking-tight">
-              Schedule Table
-            </h2>
+      {/* ===== Schedule table + matchday rail ===== */}
+      <section className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.6fr)_minmax(280px,0.5fr)] gap-12">
+        <article className="flex flex-col gap-4 min-w-0">
+          <div className="flex items-baseline justify-between flex-wrap gap-2">
+            <div>
+              <p className="eyebrow pitch mb-1">All matches</p>
+              <h2 className="text-ink">Schedule, ordered by kickoff</h2>
+            </div>
+            <span className="caption text-[var(--ink-quiet)]">
+              {displayFixtures.length} fixtures · click to set active
+            </span>
           </div>
-          <div className="overflow-auto max-h-[600px]">
-            <table className="w-full text-left border-collapse text-xs md:text-sm">
-              <thead className="sticky top-0 z-10 bg-field-bg/95 backdrop-blur-md">
-                <tr className="border-b border-line-border/50 text-[10px] text-muted-text font-bold uppercase tracking-wider">
-                  <th className="py-3 px-3">Date</th>
-                  <th className="py-3 px-2">Time UTC</th>
-                  <th className="py-3 px-3">Match</th>
-                  <th className="py-3 px-3">Stage</th>
-                  <th className="py-3 px-3">Source</th>
-                  <th className="py-3 px-2">Status</th>
-                  <th className="py-3 px-3">Content</th>
+
+          <div className="overflow-auto max-h-[640px] border-t border-[var(--rule-strong)]">
+            <table className="w-full text-left">
+              <thead>
+                <tr>
+                  <th className="w-[88px]">Date</th>
+                  <th className="w-[66px]">Kickoff</th>
+                  <th>Match</th>
+                  <th>Stage</th>
+                  <th className="w-[100px]">Source</th>
+                  <th className="w-[78px]">Status</th>
+                  <th className="w-[88px]">Content</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-line-border/10 text-ink">
-                {displayFixtures.map((fixture) => (
-                  <tr
-                    key={fixture.id}
-                    onClick={() => onSelect(fixture.id)}
-                    className={`cursor-pointer hover:bg-pitch-green/5 transition-colors duration-150 ${
-                      fixture.id === selectedId ? "bg-pitch-green/8 text-ink font-semibold" : ""
-                    }`}
-                  >
-                    <td className="py-3.5 px-3 font-mono text-muted-text whitespace-nowrap">
-                      {fixture.date}
-                    </td>
-                    <td className="py-3.5 px-2 font-mono text-slate-400">{fixture.time}</td>
-                    <td className="py-3.5 px-3">
-                      <span className="text-ink">{fixture.teamA}</span>
-                      <span className="text-muted-text mx-1.5 font-light">vs</span>
-                      <span className="text-ink">{fixture.teamB}</span>
-                    </td>
-                    <td className="py-3.5 px-3 text-muted-text whitespace-nowrap">
-                      {prettyStage(fixture.stage)}
-                    </td>
-                    <td className="py-3.5 px-3 text-xs text-muted-text truncate max-w-[120px]">
-                      {fixture.id.startsWith("fd-") && fixture.sourceId
-                        ? "dual-source"
-                        : fixture.id.startsWith("fd-")
-                        ? "football-data"
-                        : fixture.sourceId
-                        ? "sportradar"
-                        : "local"}
-                    </td>
-                    <td className="py-3.5 px-2 whitespace-nowrap">
-                      <span
-                        className={`inline-flex px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                          fixture.status === "Live"
-                            ? "bg-pressure-red/10 text-pressure-red border border-pressure-red/20"
-                            : "bg-paper-2 text-muted-text border border-line-border/30"
-                        }`}
-                      >
-                        {fixture.status}
-                      </span>
-                    </td>
-                    <td className="py-3.5 px-3 whitespace-nowrap">
-                      <span
-                        className={`inline-flex px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                          fixture.contentStatus === "Approved" || fixture.contentStatus === "Posted"
-                            ? "bg-pitch-green/10 text-pitch-green border border-pitch-green/20"
-                            : "bg-signal-gold/10 text-signal-gold border border-signal-gold/20"
-                        }`}
-                      >
-                        {fixture.contentStatus}
-                      </span>
+              <tbody>
+                {displayFixtures.map((fixture) => {
+                  const isSelected = fixture.id === selectedId;
+                  const live = fixture.status === "Live";
+                  const final = fixture.status === "Final";
+                  const contentReady =
+                    fixture.contentStatus === "Approved" || fixture.contentStatus === "Posted";
+                  return (
+                    <tr
+                      key={fixture.id}
+                      onClick={() => onSelect(fixture.id)}
+                      className={
+                        isSelected
+                          ? "!bg-[var(--paper-raised)] [&_td]:!border-b-[var(--rule-strong)]"
+                          : ""
+                      }
+                      style={
+                        isSelected ? { boxShadow: "inset 2px 0 0 0 var(--gold)" } : undefined
+                      }
+                    >
+                      <td className="text-[var(--ink-muted)] tabular whitespace-nowrap">{fixture.date}</td>
+                      <td className="text-[var(--ink-muted)] tabular whitespace-nowrap">{fixture.time}</td>
+                      <td className="text-ink whitespace-nowrap">
+                        <span className="font-medium">{fixture.teamA}</span>
+                        <span className="text-[var(--ink-quiet)] mx-2 italic font-display [font-variation-settings:'opsz'_60]">vs</span>
+                        <span className="font-medium">{fixture.teamB}</span>
+                      </td>
+                      <td className="text-[var(--ink-muted)] whitespace-nowrap">{prettyStage(fixture.stage)}</td>
+                      <td className="text-[var(--ink-quiet)] text-[0.8rem]">{sourceLabel(fixture)}</td>
+                      <td className="whitespace-nowrap">
+                        <span
+                          className={
+                            "inline-flex items-center gap-1.5 text-[0.7rem] uppercase tracking-[0.1em] font-semibold " +
+                            (live
+                              ? "text-red"
+                              : final
+                              ? "text-[var(--ink-muted)]"
+                              : "text-[var(--ink-quiet)]")
+                          }
+                        >
+                          {live && (
+                            <span
+                              aria-hidden
+                              className="inline-block w-1.5 h-1.5 rounded-full"
+                              style={{ background: "var(--red)" }}
+                            />
+                          )}
+                          {fixture.status}
+                        </span>
+                      </td>
+                      <td className="whitespace-nowrap">
+                        <span
+                          className={
+                            "text-[0.7rem] uppercase tracking-[0.1em] font-semibold " +
+                            (contentReady ? "text-pitch" : "text-gold")
+                          }
+                        >
+                          {fixture.contentStatus}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {displayFixtures.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="text-[var(--ink-muted)] py-8 text-center">
+                      No fixtures loaded — run a sync from the masthead.
                     </td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>
         </article>
 
-        <article className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4">
+        <aside className="flex flex-col gap-4 min-w-0">
           <div>
-            <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-0.5">
-              Matchday Buckets
-            </p>
-            <h2 className="text-ink text-base md:text-lg font-black tracking-tight">
-              Groups & Stages
-            </h2>
+            <p className="eyebrow pitch mb-1">Matchday rail</p>
+            <h2 className="text-ink">Groups &amp; stages</h2>
           </div>
-          <div className="flex flex-col gap-2.5 overflow-y-auto max-h-[600px] pr-1">
+          <nav className="stage-list overflow-y-auto max-h-[640px] -mr-2 pr-2">
             {Object.entries(byMatchday).map(([label, matches]) => (
-              <details
-                key={label}
-                className="group border border-line-border/40 rounded-none bg-field-bg/60 overflow-hidden"
-                open={label === "Group A"}
-              >
-                <summary className="flex items-center justify-between p-3.5 font-bold text-ink cursor-pointer hover:bg-white/5 list-none select-none transition-colors duration-150">
-                  <span className="text-sm tracking-tight">{label}</span>
-                  <span className="bg-pitch-green/15 text-pitch-green border border-pitch-green/30 text-[11px] font-bold px-2 py-0.5 rounded-full font-mono">
-                    {matches.length}
+              <details key={label} open={label === "Group A"}>
+                <summary>
+                  <span className="text-ink font-display [font-variation-settings:'opsz'_60]">
+                    {label}
                   </span>
+                  <span>{matches.length}</span>
                 </summary>
-                <div className="p-2 flex flex-col gap-1.5 border-t border-line-border/20 bg-[#090f1e]/40">
-                  {matches.map((fixture) => (
-                    <button
-                      key={fixture.id}
-                      onClick={() => onSelect(fixture.id)}
-                      className="w-full text-left p-2.5 rounded-none border border-transparent hover:border-line-border/40 hover:bg-white/5 flex flex-col gap-1 transition-all duration-200"
-                    >
-                      <div className="flex justify-between items-center w-full">
-                        <span className="text-ink text-xs font-semibold">
-                          {fixture.teamA} vs {fixture.teamB}
+                <div className="flex flex-col gap-0.5 pb-3">
+                  {matches.map((fixture) => {
+                    const isSelected = fixture.id === selectedId;
+                    return (
+                      <button
+                        key={fixture.id}
+                        onClick={() => onSelect(fixture.id)}
+                        className={`stage-match ${isSelected ? "!border-l-gold !bg-[var(--paper-raised)]" : ""}`}
+                      >
+                        <span className="text-ink text-[0.85rem] font-medium">
+                          {fixture.teamA}
+                          <span className="text-[var(--ink-quiet)] mx-1.5 italic font-display [font-variation-settings:'opsz'_60]">
+                            vs
+                          </span>
+                          {fixture.teamB}
                         </span>
-                      </div>
-                      <small className="text-[10px] text-muted-text font-mono">
-                        {fixture.date} · {fixture.time} UTC
-                      </small>
-                    </button>
-                  ))}
+                        <small className="text-[var(--ink-quiet)] text-[0.72rem] tabular tracking-[0.02em]">
+                          {fixture.date} · {fixture.time}
+                        </small>
+                      </button>
+                    );
+                  })}
                 </div>
               </details>
             ))}
-          </div>
-        </article>
+            {Object.keys(byMatchday).length === 0 && (
+              <p className="text-[var(--ink-muted)] py-6">No matches yet.</p>
+            )}
+          </nav>
+        </aside>
       </section>
 
-      <section className="bg-paper border border-line-border/50 rounded-none p-5  flex flex-col gap-4">
-        <div>
-          <p className="text-pitch-green text-[10px] font-extrabold uppercase tracking-wider mb-0.5">
-            Group Fixtures
-          </p>
-          <h2 className="text-ink text-base md:text-lg font-black tracking-tight">
-            Fixture Blocks
-          </h2>
+      {/* ===== Group fixture blocks ===== */}
+      <section className="flex flex-col gap-4">
+        <div className="flex items-baseline justify-between flex-wrap gap-2">
+          <div>
+            <p className="eyebrow pitch mb-1">Group fixtures</p>
+            <h2 className="text-ink">Round-by-round, per group</h2>
+          </div>
+          <span className="caption text-[var(--ink-quiet)]">
+            {Object.keys(byGroup).filter((g) => g.startsWith("GROUP_")).length} groups
+          </span>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-8 gap-y-6 border-t border-[var(--rule)] pt-6">
           {Object.entries(byGroup).map(([group, matches]) => (
-            <article
-              className="border border-line-border/40 rounded-none p-4 bg-field-bg/50 flex flex-col gap-3.5 hover:border-line-border transition-colors duration-300"
-              key={group}
-            >
-              <h3 className="text-ink text-xs font-extrabold uppercase tracking-wider border-b border-line-border/20 pb-1.5">
+            <article key={group} className="flex flex-col gap-3 min-w-0">
+              <h3 className="text-ink font-display [font-variation-settings:'opsz'_60] font-medium text-[1.05rem] tracking-[-0.015em] pb-2 border-b border-[var(--rule)]">
                 {prettyStage(group.replace("GROUP_", "Group "))}
               </h3>
-              <div className="flex flex-col gap-2">
-                {matches.map((fixture) => (
-                  <button
-                    key={fixture.id}
-                    onClick={() => onSelect(fixture.id)}
-                    className="w-full text-left p-2 rounded-none border border-transparent hover:border-line-border/40 hover:bg-white/5 transition-all duration-200"
-                  >
-                    <span className="text-ink text-xs block font-semibold truncate">
-                      {fixture.teamA} vs {fixture.teamB}
-                    </span>
-                    <small className="text-[10px] text-muted-text font-mono block mt-0.5">
-                      {fixture.date} · {fixture.time} UTC
-                    </small>
-                  </button>
-                ))}
+              <div className="flex flex-col gap-0">
+                {matches.map((fixture) => {
+                  const isSelected = fixture.id === selectedId;
+                  return (
+                    <button
+                      key={fixture.id}
+                      onClick={() => onSelect(fixture.id)}
+                      className={`stage-match ${isSelected ? "!border-l-gold !bg-[var(--paper-raised)]" : ""}`}
+                    >
+                      <span className="text-ink text-[0.85rem] font-medium truncate w-full">
+                        {fixture.teamA}
+                        <span className="text-[var(--ink-quiet)] mx-1.5 italic font-display [font-variation-settings:'opsz'_60]">
+                          vs
+                        </span>
+                        {fixture.teamB}
+                      </span>
+                      <small className="text-[var(--ink-quiet)] text-[0.72rem] tabular tracking-[0.02em]">
+                        {fixture.date} · {fixture.time}
+                      </small>
+                    </button>
+                  );
+                })}
               </div>
             </article>
           ))}
@@ -372,4 +440,3 @@ export function WorldCupDataView({
 }
 
 export default WorldCupDataView;
-

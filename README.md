@@ -75,8 +75,61 @@ Copy `.env.example` to `.env`, fill the keys, then restart `npm run dev`.
 - `Match Signal OS Automation Router` (`9YyGhaggomtr3OGC`): production webhook at `https://davidonilude.app.n8n.cloud/webhook/match-signal-os-router`, currently used by `/api/n8n/trigger`. Routes `manual`, `dailyBrief`, `preMatch`, `postMatch`, `report`, `telegramPreview`, and `telegramPublic` payloads into Telegram messages.
 - `Match Signal OS Daily Brief` (`9yxFpIdiTbFR0DBA`): scheduled daily 08:00 operator brief. Pulls live World Cup fixtures from football-data.org and sends the next-match queue to Telegram.
 
-## Safe Scope
+## Safe Scope (two-tier)
 
-This app is football intelligence and media automation. It does not implement betting execution, stake sizing, odds comparison, bet slips, bankroll logic, gambling recommendations, or Sportradar odds/Betradar betting feeds.
+The Match Signal OS ships as two distinct surfaces. The boundary is enforced in server code, not just copy.
 
-The Lab includes a safe Market Context module for attention, volatility, fan pressure, media momentum, and content priority. These are editorial/intelligence signals, not betting-market signals.
+### Public surface — editorial only
+
+- **Channels**: `TELEGRAM_PUBLIC_CHANNEL_ID`, all social vendors (Buffer/Postproxy/Ayrshare/Upload-Post/official APIs), the operator Telegram preview inbox.
+- **Content**: tactical context, match narrative, confidence ranges, uncertainty, attention/volatility/pressure as *editorial* signals, content priority. No picks, no odds numbers, no book names, no stake language.
+- **Guardrail**: every public publish runs through `server/services/safetyFilter.mjs`. Any of the following trips a hard 422 reject (visible to the operator): `guaranteed`, `sure thing`, `lock`, `EV`, `units`, `stake`, `bankroll`, `Kelly`, decimal-odds patterns (`1.50–9.99`), American-odds patterns (`+150`, `-200`), market shorthand (`1X2`, `BTTS`, `GG/NG`, `O/U 2.5`, `DC`, `HT/FT`), and any major sportsbook brand name.
+
+### VIP surface — gated picks
+
+- **Channel**: `TELEGRAM_BETTING_CHANNEL_ID` only. Never broadcast publicly.
+- **Content**: value picks computed *server-side* from team-rating model probability + current book decimal odds:
+  - EV per side: `modelProb × decimalOdds − 1`
+  - Fractional Kelly stake: `0.25 × full Kelly`, capped at `MAX_STAKE_UNITS=2.0`, floor `MIN_STAKE_UNITS=0.25`. Stakes below the floor publish as zero (the channel stays small and disciplined).
+  - Minimum threshold: `MIN_EV=0.04`. Picks below the threshold are dropped before publish.
+  - The LLM never supplies the EV/stake numbers — `server/services/picks.mjs` is the only source of truth. Gemini is asked only for an optional 3-sentence narrative framing.
+- **Gates** (all must pass before `/api/telegram/vip` will publish):
+  1. `TELEGRAM_BOT_TOKEN` configured
+  2. `TELEGRAM_BETTING_CHANNEL_ID` configured
+  3. `VIP_JURISDICTIONS` set to a non-empty comma-separated list (operator explicitly opts in per region)
+  4. `VIP_PUBLISH_ENABLED` is not `"false"`
+- **Responsible gambling**: every VIP message auto-appends a canonical footer with 18+/21+ language, links to US/UK/worldwide problem-gambling resources, and a `/stop` instruction. Operators cannot disable the footer; it lives in `picks.mjs`.
+- **Audit trail**: every published pick writes a row to Supabase table `pick_log` (`pick_id`, `match_id`, `market`, `side`, `model_prob`, `book_name`, `book_price`, `implied_prob`, `ev`, `stake_units`, `confidence`, `created_at`). Used later for closing-line value tracking. If Supabase is unconfigured the publish still goes through and the audit failure is reported in the response.
+
+### What this app still does not do
+
+- Bet execution (no slip placement, no in-app wagering API).
+- Bankroll automation (no in-app balance, no auto-staking).
+- Public betting recommendations on any channel other than the gated VIP one.
+
+### Required env additions for the VIP layer
+
+```
+TELEGRAM_BETTING_CHANNEL_ID=...     # the VIP channel/group id
+VIP_JURISDICTIONS=US,UK,CA,DE,NG    # operator-defined opt-in list
+VIP_PUBLISH_ENABLED=true            # set to "false" to globally pause VIP
+
+# tuning (defaults shown)
+KELLY_FRACTION=0.25
+MAX_STAKE_UNITS=2.0
+MIN_STAKE_UNITS=0.25
+MIN_EV=0.04
+PICKS_TEMP_SCALE=4.0
+PICKS_DRAW_WEIGHT=0.27
+```
+
+### Routes summary
+
+- `POST /api/telegram/preview` — operator inbox (public-safety filter applied)
+- `POST /api/telegram/public` — public channel (public-safety filter applied)
+- `POST /api/telegram/market-context` — editorial market signal to admin/public (public-safety filter applied)
+- `POST /api/telegram/betting` — **410 Gone** (deprecated; old clients fail loud)
+- `POST /api/telegram/vip/preview` — compute picks + formatted message body, do not send
+- `POST /api/telegram/vip` — publish picks to VIP channel (all four gates required)
+- `GET  /api/telegram/vip/footer` — canonical responsible-gambling footer text
+- `POST /api/social/publish` — public social publish (public-safety filter applied)

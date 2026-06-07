@@ -4,6 +4,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readSupabaseSnapshot, persistGeneratedContent, normalizeAiContent } from "./supabase.mjs";
 import { generateGeminiContent } from "./gemini.mjs";
+import { computePicks, buildVipMessage } from "./picks.mjs";
+import { publicSafetyCheck } from "./safetyFilter.mjs";
+
+const vipPublishingEnabled = () => {
+  if (process.env.VIP_PUBLISH_ENABLED === "false") return false;
+  const jurisdictions = String(process.env.VIP_JURISDICTIONS ?? "").trim();
+  return Boolean(process.env.TELEGRAM_BETTING_CHANNEL_ID) && jurisdictions.length > 0;
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
@@ -258,7 +266,7 @@ export const handleTelegramCommand = async (message) => {
         inline_keyboard: [
           [
             { text: "📢 Pub Editorial", callback_data: `pub_edit:${selectedFixture.id}` },
-            { text: "🎯 Pub Betting", callback_data: `pub_bet:${selectedFixture.id}` },
+            { text: "🎯 Send to VIP", callback_data: `pub_vip:${selectedFixture.id}` },
           ],
           [
             { text: "🔄 Revise", callback_data: `revise:${selectedFixture.id}` },
@@ -285,7 +293,8 @@ export const handleTelegramCommand = async (message) => {
         shortsScript: generatedTelegramBrief(selectedFixture, prediction),
         videoTitle: `${selectedFixture.teamA} vs ${selectedFixture.teamB}: Match Signal Preview`,
         reportSection: generatedTelegramBrief(selectedFixture, prediction),
-        bettingAngle: "Betting intelligence pending — generate AI content to unlock EV analysis.",
+        marketContext: "Market context pending — generate AI content to unlock editorial attention, volatility, and narrative pressure notes.",
+        bettingAngle: "Market context pending — generate AI content to unlock editorial attention, volatility, and narrative pressure notes.",
         safetyNotes: [`AI generation fallback used: ${error.message}`],
       });
       generated = { content: fallback, raw: "" };
@@ -314,7 +323,7 @@ export const handleTelegramCommand = async (message) => {
         inline_keyboard: [
           [
             { text: "📢 Pub Editorial", callback_data: `pub_edit:${selectedFixture.id}` },
-            { text: "🎯 Pub Betting", callback_data: `pub_bet:${selectedFixture.id}` },
+            { text: "🎯 Send to VIP", callback_data: `pub_vip:${selectedFixture.id}` },
           ],
           [
             { text: "🔄 Revise", callback_data: `revise:${selectedFixture.id}` },
@@ -359,6 +368,13 @@ export const handleTelegramCallback = async (callbackQuery) => {
       await telegramSendMessage({ chatId, text: `❌ Cannot publish: Editorial draft for ${matchId} is missing. Run /generate first.` });
       return;
     }
+    // Public-safety filter: editorial copy must not contain pick/odds language.
+    const safety = publicSafetyCheck(content.telegram);
+    if (!safety.ok) {
+      const vlabel = safety.violations.map((v) => `${v.kind}: "${v.match}"`).join(", ");
+      await telegramSendMessage({ chatId, text: `❌ Editorial draft was rejected by public-safety filter (${vlabel}). Re-generate or edit to remove pick/odds language.` });
+      return;
+    }
     try {
       await telegramSendMessage({
         chatId: process.env.TELEGRAM_PUBLIC_CHANNEL_ID,
@@ -366,27 +382,53 @@ export const handleTelegramCallback = async (callbackQuery) => {
       });
       state.fixtures = fixtures.map((f) => f.id === matchId ? { ...f, contentStatus: "Posted" } : f);
       await writeAppState(state);
-      await telegramSendMessage({ chatId, text: `📢 Successfully published Editorial Brief for ${match ? fixtureLabel(match) : matchId} to public channel!` });
+      await telegramSendMessage({ chatId, text: `📢 Published editorial brief for ${match ? fixtureLabel(match) : matchId} to public channel.` });
     } catch (err) {
       await telegramSendMessage({ chatId, text: `❌ Failed to publish to public channel: ${err.message}` });
     }
     return;
   }
 
-  if (action === "pub_bet") {
-    if (!content || !content.bettingAngle || content.bettingAngle.startsWith("Betting intelligence pending")) {
-      await telegramSendMessage({ chatId, text: `❌ Cannot publish: Betting draft for ${matchId} is missing or pending.` });
+  if (action === "pub_vip" || action === "pub_bet") {
+    // Triple gate before publishing picks.
+    if (!vipPublishingEnabled()) {
+      await telegramSendMessage({
+        chatId,
+        text: `❌ VIP publishing is not enabled. Set VIP_JURISDICTIONS=US,UK,… and TELEGRAM_BETTING_CHANNEL_ID in .env. See README VIP scope.`,
+      });
       return;
     }
+    if (!match) {
+      await telegramSendMessage({ chatId, text: `❌ Cannot publish: fixture ${matchId} not found.` });
+      return;
+    }
+    // Picks come from server-side EV math, not from the model's freeform text.
+    const teamRatings = state.ratings ?? [];
+    const picks = computePicks(match, teamRatings);
+    if (!picks.length) {
+      await telegramSendMessage({
+        chatId,
+        text: `⚠️ No value picks at current prices for ${fixtureLabel(match)}. Nothing was published. Update odds or wait for the market to move.`,
+      });
+      return;
+    }
+    const message = buildVipMessage(match, picks);
     try {
-      const fullText = `⚽️ ${match ? `${match.teamA} vs ${match.teamB}` : "Match Preview"}\n🎯 Betting Angle:\n\n${content.bettingAngle}`;
       await telegramSendMessage({
         chatId: process.env.TELEGRAM_BETTING_CHANNEL_ID,
-        text: fullText,
+        text: message,
       });
-      state.fixtures = fixtures.map((f) => f.id === matchId ? { ...f, contentStatus: "Posted" } : f);
-      await writeAppState(state);
-      await telegramSendMessage({ chatId, text: `🎯 Successfully published Betting Angle for ${match ? fixtureLabel(match) : matchId} to VIP channel!` });
+      // Best-effort audit log
+      try {
+        const { logPicks } = await import("./supabase.mjs");
+        if (typeof logPicks === "function") await logPicks({ fixture: match, picks });
+      } catch (logError) {
+        console.warn("[telegram] picks audit log failed:", logError?.message ?? logError);
+      }
+      await telegramSendMessage({
+        chatId,
+        text: `🎯 Published ${picks.length} value pick(s) for ${fixtureLabel(match)} to VIP channel.\n\nTop edge: +${(picks[0].ev * 100).toFixed(1)}% on ${picks[0].side} @ ${picks[0].bookPrice.toFixed(2)} (${picks[0].stakeUnits.toFixed(2)}u).`,
+      });
     } catch (err) {
       await telegramSendMessage({ chatId, text: `❌ Failed to publish to VIP channel: ${err.message}` });
     }

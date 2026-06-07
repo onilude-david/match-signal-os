@@ -1,6 +1,41 @@
 export type FixtureStatus = "Scheduled" | "Live" | "Final";
 export type ContentStatus = "Draft" | "Approved" | "Posted";
-export type View = "command" | "data" | "lab" | "brand" | "content" | "video" | "automation" | "review";
+export type View = "command" | "data" | "lab" | "brand" | "content" | "video" | "automation" | "review" | "vip";
+
+// A single value pick. Numbers come from server/services/picks.mjs (Kelly +
+// EV math), not from the model's freeform text. Confidence is derived from EV.
+export type Pick = {
+  id: string;
+  fixtureId: string;
+  market: "1X2";
+  side: "Home" | "Draw" | "Away";
+  label: string;
+  modelProb: number;
+  bookName: string;
+  bookPrice: number;
+  impliedProb: number;
+  ev: number;
+  stakeUnits: number;
+  confidence: "Low" | "Medium" | "High";
+  createdAt: string;
+};
+
+export type VipPreviewResponse = {
+  ok: boolean;
+  picks: Pick[];
+  message: string | null;
+  vipPublishEnabled: boolean;
+  jurisdictions: string[];
+};
+
+export type VipPublishResponse = {
+  ok: boolean;
+  published?: boolean;
+  pickCount?: number;
+  picks?: Pick[];
+  audit?: { logged: boolean; count?: number; error?: string };
+  reason?: string;
+};
 
 export type Fixture = {
   id: string;
@@ -130,6 +165,14 @@ export type ContentPack = {
   shortsScript: string;
   videoTitle: string;
   reportSection: string;
+  /**
+   * Editorial market signal — attention, volatility, narrative pressure.
+   * Public-safe. No picks, no odds, no book names, no stake language.
+   */
+  marketContext: string;
+  /**
+   * @deprecated kept for Supabase row back-compat. Use marketContext.
+   */
   bettingAngle: string;
   safetyNotes: string[];
 };
@@ -160,18 +203,106 @@ export type ClipPlan = {
   status: string;
 };
 
+export type AspectKey = "9x16" | "1x1" | "16x9" | "4x5";
+
 export type RenderJob = {
   id: string;
   title: string;
   matchId: string;
   clipType: string;
+  aspect?: AspectKey | "source";
   mode: string;
   cropMode: string;
   startTime: number;
   duration: number;
+  width?: number | null;
+  height?: number | null;
+  platforms?: string[];
+  encoder?: string;
   sourcePath: string;
   outputPath: string;
   publicUrl: string;
+  startedAt?: string;
   completedAt: string;
-  command: string[];
+  command?: string[];
+  gpuAcceleration?: boolean;
+  gpuFallback?: boolean;
+};
+
+// /api/video/scan -> ScanResult
+export type ClipSuggestion = {
+  id: string;
+  type: "signal" | "emotion" | "context" | "recap";
+  start: number;
+  end: number;
+  duration: number;
+  score: number;
+  reason: string;
+};
+
+export type ScanScene = { time: number; score: number | null };
+export type ScanPeak = { time: number; duration: number };
+export type ScanCrop = {
+  recommended: boolean;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+};
+
+export type ScanResult = {
+  source: string;
+  duration: number;
+  width: number;
+  height: number;
+  fps: number;
+  hasAudio: boolean;
+  crop: ScanCrop;
+  scenes: ScanScene[];
+  peaks: ScanPeak[];
+  suggestions: ClipSuggestion[];
+};
+
+// /api/video/transcribe -> TranscriptCue[]
+export type TranscriptCue = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+export type TranscriptResult = {
+  modelPath: string;
+  startSeconds: number;
+  durationSeconds: number;
+  cues: TranscriptCue[];
+  srtPath: string;
+  jsonPath: string;
+  log: string;
+};
+
+// /api/video/status -> aspects array element
+export type AspectInfo = {
+  key: AspectKey;
+  label: string;
+  width: number;
+  height: number;
+  platforms: string[];
+};
+
+export type VideoEngineStatus = {
+  ok: boolean;
+  ffmpeg: {
+    configured: boolean;
+    version?: string;
+    error?: string;
+    encoders?: Record<string, boolean>;
+  };
+  whisper: {
+    configured: boolean;
+    modelPath: string;
+    suggestion: string | null;
+  };
+  aspects: AspectInfo[];
+  outputDir: string;
+  publicBaseUrl: string;
 };

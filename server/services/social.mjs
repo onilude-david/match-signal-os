@@ -79,6 +79,194 @@ export const normalizeSocialPayload = ({ platforms = [], text = "", title = "", 
   },
 });
 
+// ---------------------------------------------------------------------------
+// Buffer GraphQL adapter
+// ---------------------------------------------------------------------------
+// Buffer's public API is GraphQL, not REST. The generic JSON wrapper used for
+// Ayrshare / Upload-Post / Postproxy cannot speak it. This adapter:
+//   1. Resolves the operator's organizationId from `account`.
+//   2. Lists `channels` and maps service → channelId (cached for 10 minutes).
+//   3. For each requested platform, fires a `createPost` mutation.
+// Aliases for `platforms` ("x" → twitter, "instagram-reels" → instagram, etc.)
+// keep the public API tolerant of whatever string the caller sends.
+
+const BUFFER_CACHE_TTL_MS = 10 * 60 * 1000;
+let bufferChannelCache = { fetchedAt: 0, organizationId: null, channelsByService: {} };
+
+const PLATFORM_ALIASES = {
+  x: "twitter",
+  "x.com": "twitter",
+  twitter: "twitter",
+  instagram: "instagram",
+  "instagram-reels": "instagram",
+  "instagram-post": "instagram",
+  ig: "instagram",
+  tiktok: "tiktok",
+  "tiktok-video": "tiktok",
+  facebook: "facebook",
+  fb: "facebook",
+  linkedin: "linkedin",
+  threads: "threads",
+  youtube: "youtube",
+  "youtube-shorts": "youtube",
+};
+
+const canonicalPlatform = (raw) => PLATFORM_ALIASES[String(raw ?? "").trim().toLowerCase()] ?? null;
+
+const bufferGraphql = async ({ apiKey, baseUrl, query, variables }) => {
+  const response = await fetch(`${baseUrl}/graphql`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`Buffer GraphQL HTTP ${response.status}: ${JSON.stringify(body).slice(0, 400)}`);
+  }
+  if (Array.isArray(body.errors) && body.errors.length) {
+    throw new Error(`Buffer GraphQL errors: ${body.errors.map((e) => e.message).join("; ")}`);
+  }
+  return body.data;
+};
+
+const refreshBufferChannelCache = async ({ apiKey, baseUrl }) => {
+  const account = await bufferGraphql({
+    apiKey,
+    baseUrl,
+    query: "{ account { currentOrganization { id } } }",
+  });
+  const organizationId = account?.account?.currentOrganization?.id;
+  if (!organizationId) throw new Error("Buffer account has no currentOrganization. Check the API token.");
+
+  const channels = await bufferGraphql({
+    apiKey,
+    baseUrl,
+    query: "query($input: ChannelsInput!) { channels(input: $input) { id name service } }",
+    variables: { input: { organizationId } },
+  });
+
+  const channelsByService = {};
+  for (const channel of channels?.channels ?? []) {
+    const service = String(channel.service ?? "").toLowerCase();
+    if (!channelsByService[service]) channelsByService[service] = [];
+    channelsByService[service].push({ id: channel.id, name: channel.name, service });
+  }
+
+  bufferChannelCache = { fetchedAt: Date.now(), organizationId, channelsByService };
+  return bufferChannelCache;
+};
+
+const getBufferChannels = async ({ apiKey, baseUrl, force = false }) => {
+  if (!force && bufferChannelCache.organizationId && Date.now() - bufferChannelCache.fetchedAt < BUFFER_CACHE_TTL_MS) {
+    return bufferChannelCache;
+  }
+  return refreshBufferChannelCache({ apiKey, baseUrl });
+};
+
+const publishWithBuffer = async ({ apiKey, baseUrl, payload }) => {
+  const cache = await getBufferChannels({ apiKey, baseUrl });
+
+  // Map requested platforms → channelIds. We only support text-only posts
+  // here; media uploads require Buffer's separate asset-upload flow, which
+  // is documented but not wired (TODO).
+  const requested = (payload.platforms ?? []).map(canonicalPlatform).filter(Boolean);
+  const unique = [...new Set(requested)];
+  if (!unique.length) {
+    throw new Error(`No recognised Buffer platform in: ${JSON.stringify(payload.platforms ?? [])}. Connected services: ${Object.keys(cache.channelsByService).join(", ") || "none"}`);
+  }
+
+  const missing = unique.filter((service) => !cache.channelsByService[service]?.length);
+  if (missing.length) {
+    throw new Error(`Buffer has no connected channel for: ${missing.join(", ")}. Connected services: ${Object.keys(cache.channelsByService).join(", ")}`);
+  }
+
+  if ((payload.mediaUrls ?? []).length) {
+    throw new Error("Buffer media upload is not wired in this adapter yet — send text-only here, or attach media in Buffer UI after queueing. Set mediaUrls=[] to proceed.");
+  }
+
+  // Default to addToQueue (safest — goes into Buffer's normal scheduling
+  // queue). Operator can override with mode=shareNow / customScheduled etc.
+  const mode = String(payload.metadata?.bufferMode ?? "addToQueue");
+  const schedulingType = mode === "customScheduled" ? "customScheduled" : "automatic";
+  const dueAt = payload.scheduleAt || undefined;
+
+  // Buffer's createPost returns the PostActionPayload union with members:
+  // PostActionSuccess, NotFoundError, UnauthorizedError, UnexpectedError,
+  // RestProxyError, LimitReachedError, InvalidInputError. All errors carry
+  // a `message`; RestProxyError additionally exposes `code`.
+  const mutation = `mutation Create($input: CreatePostInput!) {
+    createPost(input: $input) {
+      __typename
+      ... on PostActionSuccess { post { id } }
+      ... on UnexpectedError { message }
+      ... on InvalidInputError { message }
+      ... on NotFoundError { message }
+      ... on UnauthorizedError { message }
+      ... on LimitReachedError { message }
+      ... on RestProxyError { message code }
+    }
+  }`;
+
+  const results = [];
+  for (const service of unique) {
+    for (const channel of cache.channelsByService[service]) {
+      const input = {
+        channelId: channel.id,
+        text: payload.text || "",
+        schedulingType,
+        mode,
+        assets: [],
+        source: "match-signal-os",
+        ...(dueAt ? { dueAt } : {}),
+      };
+      try {
+        const data = await bufferGraphql({
+          apiKey,
+          baseUrl,
+          query: mutation,
+          variables: { input },
+        });
+        results.push({
+          channelId: channel.id,
+          service: channel.service,
+          name: channel.name,
+          ok: data?.createPost?.__typename === "PostActionSuccess",
+          result: data?.createPost,
+        });
+      } catch (error) {
+        results.push({
+          channelId: channel.id,
+          service: channel.service,
+          name: channel.name,
+          ok: false,
+          error: error.message,
+        });
+      }
+    }
+  }
+
+  // Always return per-channel results — the caller (route) decides whether
+  // a partial failure should be a 207-style aggregate response or a 502.
+  // Surface Buffer's per-error message into the top-level `error` field so
+  // downstream UIs don't have to dig into the union shape.
+  const enriched = results.map((r) => ({
+    ...r,
+    error: r.error ?? (r.ok ? null : r.result?.message ?? `${r.result?.__typename ?? "Unknown"} from Buffer`),
+  }));
+  const allOk = enriched.every((r) => r.ok);
+  return {
+    provider: "buffer",
+    organizationId: cache.organizationId,
+    mode,
+    schedulingType,
+    ok: allOk,
+    results: enriched,
+  };
+};
+
 export const publishWithSocialVendor = async ({ provider, payload }) => {
   const vendor = socialVendors[provider];
   if (!vendor) throw new Error(`Unsupported social provider: ${provider}`);
@@ -88,6 +276,10 @@ export const publishWithSocialVendor = async ({ provider, payload }) => {
   const publishPath = process.env[vendor.pathEnv] || vendor.defaultPath;
   if (!apiKey) throw new Error(`${vendor.apiKeyEnv} is not configured.`);
   if (!baseUrl) throw new Error(`${vendor.baseUrlEnv} is not configured. Add the vendor API base URL.`);
+
+  if (provider === "buffer") {
+    return publishWithBuffer({ apiKey, baseUrl, payload });
+  }
 
   const response = await fetch(`${baseUrl}${publishPath}`, {
     method: "POST",
@@ -102,4 +294,21 @@ export const publishWithSocialVendor = async ({ provider, payload }) => {
     throw new Error(body.error ?? body.message ?? `${vendor.label} publish failed with ${response.status}`);
   }
   return body;
+};
+
+// Exported for diagnostics. Returns connected services + channel names.
+export const inspectBufferChannels = async () => {
+  const apiKey = process.env.BUFFER_API_KEY;
+  const baseUrl = (process.env.BUFFER_BASE_URL || socialVendors.buffer.defaultBaseUrl).replace(/\/$/, "");
+  if (!apiKey) throw new Error("BUFFER_API_KEY is not configured.");
+  const cache = await getBufferChannels({ apiKey, baseUrl, force: true });
+  return {
+    organizationId: cache.organizationId,
+    services: Object.fromEntries(
+      Object.entries(cache.channelsByService).map(([service, channels]) => [
+        service,
+        channels.map((c) => ({ id: c.id, name: c.name })),
+      ]),
+    ),
+  };
 };

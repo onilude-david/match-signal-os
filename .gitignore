@@ -4,3 +4,12 @@ dist/
 .env
 .env.local
 *.local
+.claude/
+.claude/settings.local.json
+artifacts/clips/*.mp4
+artifacts/clips/smoke/
+artifacts/clips/verify/
+artifacts/subtitles/
+artifacts/thumbs/
+artifacts/waves/
+artifacts/test-workbook.xlsx

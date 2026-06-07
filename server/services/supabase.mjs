@@ -11,6 +11,7 @@ export const getSupabase = () => {
 
 export const normalizeAiContent = (content) => {
   if (!content) return null;
+  const marketContext = content.marketContext || content.bettingAngle || "";
   return {
     telegram: content.telegram || "",
     xPost: content.xPost || "",
@@ -18,9 +19,39 @@ export const normalizeAiContent = (content) => {
     shortsScript: content.shortsScript || "",
     videoTitle: content.videoTitle || "",
     reportSection: content.reportSection || "",
-    bettingAngle: content.bettingAngle || content.marketContext || "",
+    marketContext,
+    // back-compat: older schema column name
+    bettingAngle: marketContext,
     safetyNotes: Array.isArray(content.safetyNotes) ? content.safetyNotes : [],
   };
+};
+
+// Audit log for VIP picks. Best-effort: if the pick_log table is missing the
+// caller catches the error so a logging failure doesn't block a publish.
+export const logPicks = async ({ fixture, picks }) => {
+  if (!process.env.SUPABASE_URL || (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_PUBLISHABLE_KEY)) {
+    // Supabase not configured — no-op so audit failure never blocks publish.
+    return { logged: false, reason: "supabase not configured" };
+  }
+  const supabase = getSupabase();
+  const rows = picks.map((pick) => ({
+    pick_id: pick.id,
+    match_id: fixture.id,
+    market: pick.market,
+    side: pick.side,
+    label: pick.label,
+    model_prob: pick.modelProb,
+    book_name: pick.bookName,
+    book_price: pick.bookPrice,
+    implied_prob: pick.impliedProb,
+    ev: pick.ev,
+    stake_units: pick.stakeUnits,
+    confidence: pick.confidence,
+    created_at: pick.createdAt ?? new Date().toISOString(),
+  }));
+  const result = await supabase.from("pick_log").upsert(rows, { onConflict: "pick_id" });
+  if (result.error) throw new Error(result.error.message);
+  return { logged: true, count: rows.length };
 };
 
 export const fixtureFromRow = (row) => ({

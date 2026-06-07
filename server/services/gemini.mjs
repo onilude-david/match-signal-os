@@ -6,16 +6,25 @@ export const parseGeminiText = (body) => {
   return text.trim();
 };
 
-export const normalizeAiContent = (content = {}) => ({
-  telegram: String(content.telegram ?? ""),
-  xPost: String(content.xPost ?? ""),
-  thread: String(content.thread ?? content.reportSection ?? ""),
-  shortsScript: String(content.shortsScript ?? ""),
-  videoTitle: String(content.videoTitle ?? ""),
-  reportSection: String(content.reportSection ?? ""),
-  bettingAngle: String(content.bettingAngle ?? content.marketContext ?? ""),
-  safetyNotes: Array.isArray(content.safetyNotes) ? content.safetyNotes.map(String) : [],
-});
+// Normalize editorial content (PUBLIC layer). bettingAngle is kept as an alias
+// onto marketContext for back-compat with any existing Supabase rows, but the
+// model is no longer asked to produce picks here. marketContext is editorial
+// market signal only — attention, volatility, narrative pressure.
+export const normalizeAiContent = (content = {}) => {
+  const marketContext = String(content.marketContext ?? content.bettingAngle ?? "");
+  return {
+    telegram: String(content.telegram ?? ""),
+    xPost: String(content.xPost ?? ""),
+    thread: String(content.thread ?? content.reportSection ?? ""),
+    shortsScript: String(content.shortsScript ?? ""),
+    videoTitle: String(content.videoTitle ?? ""),
+    reportSection: String(content.reportSection ?? ""),
+    marketContext,
+    // back-compat: older callers still read bettingAngle
+    bettingAngle: marketContext,
+    safetyNotes: Array.isArray(content.safetyNotes) ? content.safetyNotes.map(String) : [],
+  };
+};
 
 export const clampTeamRating = (value, fallback = 6) => {
   const number = Number(value);
@@ -35,6 +44,24 @@ export const normalizeTeamRating = (rating = {}, fallbackTeam = "") => ({
   motivation: clampTeamRating(rating.motivation, 7),
 });
 
+// ============================================================================
+// PUBLIC editorial content
+// Generates Telegram, X, Shorts, report, and an editorial marketContext field.
+// No picks, no odds numbers, no stake language, no book names. This is the
+// content that goes to TELEGRAM_PUBLIC_CHANNEL_ID and social.
+// ============================================================================
+
+const PUBLIC_SYSTEM_INSTRUCTION = [
+  "You are the editorial voice of The Match Signal.",
+  "You write calm-authority football intelligence: tactical context, match narrative,",
+  "confidence ranges, and uncertainty. You do NOT produce betting picks, EV claims,",
+  "unit stakes, odds recommendations, book names, market shorthand (1X2, BTTS, O/U),",
+  "or any 'guaranteed/sure/lock' language. The marketContext field is editorial only:",
+  "attention level, volatility (how swingy this read is), fan pressure, narrative",
+  "pressure, and content priority. If sportradarIntel is provided, weave lineup,",
+  "missing-player, and momentum context into the narrative. Return concise JSON only.",
+].join(" ");
+
 export const generateGeminiContent = async ({ fixture, prediction, scenarios, intel = null }) => {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is not configured.");
@@ -51,21 +78,15 @@ export const generateGeminiContent = async ({ fixture, prediction, scenarios, in
 
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      system_instruction: {
-        parts: {
-          text: "You create football intelligence content for The Match Signal. You produce two layers of output: (1) editorial match intelligence — tactical context, match narratives, confidence, uncertainty, content angles, and audience-safe football analysis; (2) a professional betting intelligence addon — Expected Value (EV) analysis, odds comparison, unit stakes, and market recommendations. For the bettingAngle field, write for a worldwide sportsbook audience. Use universal betting parlance: 1X2 (1=Home, X=Draw, 2=Away), GG/NG (Goal/Goal, No Goal) for BTTS, O/U 2.5 for Over/Under, DC for Double Chance, HT/FT for Half-Time/Full-Time. Reference global platforms (Bet365, DraftKings, SportyBet, Bet9ja, 1xBet, Betway, William Hill). Include EV percentage calculations when odds are provided. Always add a responsible gambling disclaimer. Do not guarantee wins. If sportradarIntel is provided, analyze the lineup formations, starting XI, bench players, injured/missing players, match timeline events (if live/post-match), and momentum swings to construct a highly context-aware, precise narrative and betting angle. Return concise JSON only."
-        }
-      },
+      system_instruction: { parts: { text: PUBLIC_SYSTEM_INSTRUCTION } },
       contents: [
         {
           parts: [
             {
               text: JSON.stringify({
-                task: "Generate Telegram, X, Shorts, report, betting angle, and safety notes for this match.",
+                task: "Generate editorial Telegram, X, Shorts, report, marketContext, and safety notes for this match.",
                 fixture,
                 prediction,
                 scenarios,
@@ -77,7 +98,7 @@ export const generateGeminiContent = async ({ fixture, prediction, scenarios, in
                   shortsScript: "string",
                   videoTitle: "string",
                   reportSection: "string",
-                  bettingAngle: "string. Professional betting intelligence: EV analysis, recommended markets (1X2, GG/NG, O/U 2.5, DC), unit stakes, odds comparison vs model confidence. Include responsible gambling disclaimer.",
+                  marketContext: "string. Editorial market signal only: attention level, volatility, fan pressure, narrative pressure, content priority. No odds numbers, no picks, no book names, no stake language.",
                   safetyNotes: ["string"],
                 },
               })
@@ -85,9 +106,7 @@ export const generateGeminiContent = async ({ fixture, prediction, scenarios, in
           ]
         }
       ],
-      generationConfig: {
-        responseMimeType: "application/json"
-      }
+      generationConfig: { responseMimeType: "application/json" }
     }),
   });
   const body = await response.json().catch(() => ({}));
@@ -102,6 +121,70 @@ export const generateGeminiContent = async ({ fixture, prediction, scenarios, in
   return { content: normalizeAiContent(JSON.parse(text)), raw: text };
 };
 
+// ============================================================================
+// VIP narrative wrapper
+// Picks come from server/services/picks.mjs (real EV math, not model fiat).
+// This function asks Gemini ONLY for a short narrative paragraph that frames
+// the picks for the VIP channel audience. The numbers in the published message
+// always come from picks.mjs — the model never invents EV or stake.
+// ============================================================================
+
+const VIP_SYSTEM_INSTRUCTION = [
+  "You write a single short narrative paragraph (3 sentences max) framing why",
+  "a value pick exists in a football match. You are NOT computing EV, stake, or",
+  "odds — those numbers are provided to you and you must not change them or add",
+  "your own. Sober tone, no hype, no guarantees, no 'sure' or 'lock' language.",
+  "Do NOT add a responsible-gambling disclaimer — the system adds the official one.",
+  "Return JSON: { narrative: string }.",
+].join(" ");
+
+export const generateVipNarrative = async ({ fixture, picks, prediction }) => {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not configured.");
+  }
+  if (!picks?.length) {
+    return { narrative: "" };
+  }
+  const geminiApiKey = process.env.GEMINI_API_KEY.trim();
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      system_instruction: { parts: { text: VIP_SYSTEM_INSTRUCTION } },
+      contents: [
+        {
+          parts: [
+            {
+              text: JSON.stringify({
+                task: "Write a 3-sentence narrative framing for these value picks.",
+                fixture: { teamA: fixture.teamA, teamB: fixture.teamB, stage: fixture.stage, venue: fixture.venue },
+                prediction,
+                picks: picks.map(({ id, fixtureId, bookPrice, bookName, ev, stakeUnits, ...rest }) => rest),
+              })
+            }
+          ]
+        }
+      ],
+      generationConfig: { responseMimeType: "application/json" }
+    }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return { narrative: "" };
+  }
+  const text = parseGeminiText(body);
+  try {
+    const parsed = JSON.parse(text);
+    return { narrative: String(parsed.narrative ?? "") };
+  } catch {
+    return { narrative: "" };
+  }
+};
+
+// ============================================================================
+// Team rating starter
+// ============================================================================
+
 export const generateGeminiRatings = async ({ teams, fixtures }) => {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is not configured.");
@@ -110,9 +193,7 @@ export const generateGeminiRatings = async ({ teams, fixtures }) => {
   const geminiApiKey = process.env.GEMINI_API_KEY.trim();
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       system_instruction: {
         parts: {
@@ -147,9 +228,7 @@ export const generateGeminiRatings = async ({ teams, fixtures }) => {
           ]
         }
       ],
-      generationConfig: {
-        responseMimeType: "application/json"
-      }
+      generationConfig: { responseMimeType: "application/json" }
     }),
   });
   const body = await response.json().catch(() => ({}));

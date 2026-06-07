@@ -61,3 +61,29 @@ create table if not exists public.workflow_events (
   payload jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now()
 );
+
+-- VIP picks audit log. One row per pick per publish, upserted on pick_id.
+-- Used later for closing-line value tracking and ROI calculation. Public
+-- surfaces never query this table.
+create table if not exists public.pick_log (
+  pick_id text primary key,
+  match_id text references public.fixtures(match_id) on delete set null,
+  market text not null,
+  side text not null,
+  label text,
+  model_prob numeric not null,
+  book_name text,
+  book_price numeric not null,
+  implied_prob numeric,
+  ev numeric not null,
+  stake_units numeric not null,
+  confidence text,
+  closing_price numeric,   -- backfilled later for CLV
+  result text,             -- 'Win' | 'Loss' | 'Void' | null until settled
+  settled_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists pick_log_match_id_idx on public.pick_log (match_id);
+create index if not exists pick_log_created_at_idx on public.pick_log (created_at desc);

@@ -5,7 +5,9 @@ import {
   normalizeSocialPayload,
   publishWithSocialVendor,
   officialSocialApis,
+  inspectBufferChannels,
 } from "../services/social.mjs";
+import { publicSafetyCheck } from "../services/safetyFilter.mjs";
 
 const router = express.Router();
 
@@ -42,6 +44,18 @@ router.post("/social/publish", async (req, res) => {
     return;
   }
 
+  // Social goes public. Apply the same safety filter as TELEGRAM_PUBLIC_CHANNEL_ID.
+  // This blocks accidental publishing of pick/odds/EV/book language to public socials.
+  const safety = publicSafetyCheck(payload.text || "");
+  if (!safety.ok) {
+    return res.status(422).json({
+      ok: false,
+      error: "Public-safety filter rejected this social publish.",
+      violations: safety.violations,
+      hint: "Public social posts must not contain picks, odds, market shorthand, book names, or staking vocabulary. Picks go through /api/telegram/vip only.",
+    });
+  }
+
   if (dryRun) {
     res.json({
       ok: true,
@@ -55,9 +69,33 @@ router.post("/social/publish", async (req, res) => {
 
   try {
     const result = await publishWithSocialVendor({ provider, payload });
+    // The Buffer adapter returns a structured per-channel result. Honour its
+    // `ok` flag: full success → 200, partial success → 207, total failure → 502.
+    if (result && typeof result === "object" && Array.isArray(result.results) && "ok" in result) {
+      const okCount = result.results.filter((r) => r.ok).length;
+      const status = result.ok ? 200 : okCount > 0 ? 207 : 502;
+      return res.status(status).json({
+        ok: result.ok,
+        partial: !result.ok && okCount > 0,
+        dryRun: false,
+        provider,
+        result,
+      });
+    }
     res.json({ ok: true, dryRun: false, provider, result });
   } catch (error) {
     jsonError(res, 502, error.message);
+  }
+});
+
+// GET /api/social/buffer/channels — list connected Buffer channels.
+router.get("/social/buffer/channels", async (_req, res) => {
+  if (!assertEnv(res, "BUFFER_API_KEY")) return;
+  try {
+    const info = await inspectBufferChannels();
+    res.json({ ok: true, ...info });
+  } catch (error) {
+    jsonError(res, 502, "Buffer channels lookup failed.", error.message);
   }
 });
 
