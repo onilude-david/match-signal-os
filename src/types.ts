@@ -229,6 +229,47 @@ export type RenderJob = {
   gpuFallback?: boolean;
 };
 
+export type VideoSourceCandidate = {
+  id: string;
+  provider: string;
+  title: string;
+  matchTitle: string;
+  competition: string;
+  date: string;
+  thumbnail?: string;
+  embed?: string;
+  url?: string;
+  sourceUrl?: string;
+  rightsStatus: "editable" | "embed_only" | "needs_rights_check" | string;
+  rightsLabel: string;
+  editable: boolean;
+  importable: boolean;
+  reason: string;
+  notes: string;
+};
+
+export type VideoSourceSearchResponse = {
+  ok: boolean;
+  sources: VideoSourceCandidate[];
+  providers: Array<{
+    key: string;
+    label: string;
+    configured: boolean;
+    mode: string;
+    rightsMode: string;
+  }>;
+  errors: Array<{ provider: string; message: string; status?: number; details?: unknown }>;
+  catalog?: Array<{
+    key: string;
+    label: string;
+    category: string;
+    status: string;
+    editable: boolean | "license_dependent";
+    docs: string;
+    note: string;
+  }>;
+};
+
 // /api/video/scan -> ScanResult
 export type ClipSuggestion = {
   id: string;
@@ -278,6 +319,37 @@ export type TranscriptResult = {
   srtPath: string;
   jsonPath: string;
   log: string;
+};
+
+// /api/video/youtube/probe -> YouTubeInfo
+export type YouTubeInfo = {
+  id: string;
+  title: string;
+  channel: string;
+  channelUrl?: string;
+  duration: number;
+  uploadDate?: string | null;
+  viewCount?: number;
+  description?: string;
+  thumbnail?: string | null;
+  webpageUrl: string;
+  bestProgressiveHeight?: number | null;
+  isLive?: boolean;
+};
+
+export type YouTubeDownloadResult = {
+  id: string;
+  sourceRelPath: string;
+  publicUrl: string;
+  cached: boolean;
+  info: YouTubeInfo;
+};
+
+export type YouTubeStatus = {
+  configured: boolean;
+  kind: "binary" | "python" | "bundled" | "missing";
+  version: string | null;
+  suggestion: string | null;
 };
 
 // /api/video/status -> aspects array element

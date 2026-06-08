@@ -51,6 +51,62 @@ export const telegramSendMessage = async ({ chatId, text, parseMode }) => {
   return body;
 };
 
+// Telegram Bot API limits a direct video upload to 50MB. Larger files
+// require either a self-hosted Bot API server or attach-by-URL (which
+// needs a public URL we don't have locally). 50MB covers our editorial
+// clips comfortably (typical 9:16 30s render lands at 5-15MB).
+const TELEGRAM_VIDEO_LIMIT_BYTES = 50 * 1024 * 1024;
+
+// Send a local video file to a Telegram chat. Uses multipart/form-data
+// (Node 18+ has FormData + Blob in globals). Optional thumbnail/duration/
+// width/height get passed straight through when supplied.
+export const telegramSendVideo = async ({
+  chatId,
+  videoPath,
+  caption = "",
+  parseMode = null,
+  duration = null,
+  width = null,
+  height = null,
+  supportsStreaming = true,
+}) => {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+
+  const { readFile, stat } = await import("node:fs/promises");
+  const fileStats = await stat(videoPath);
+  if (fileStats.size > TELEGRAM_VIDEO_LIMIT_BYTES) {
+    const mb = (fileStats.size / 1024 / 1024).toFixed(1);
+    throw new Error(
+      `Telegram upload limit is 50MB; this clip is ${mb}MB. ` +
+      `Re-render with a tighter window, a smaller aspect, or HEVC/AV1 to land under the cap.`,
+    );
+  }
+
+  const bytes = await readFile(videoPath);
+  const fileName = videoPath.split(/[\\/]/).pop() ?? "clip.mp4";
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption);
+  if (parseMode) form.append("parse_mode", parseMode);
+  if (duration != null) form.append("duration", String(Math.round(duration)));
+  if (width != null) form.append("width", String(width));
+  if (height != null) form.append("height", String(height));
+  if (supportsStreaming) form.append("supports_streaming", "true");
+  form.append("video", new Blob([bytes], { type: "video/mp4" }), fileName);
+
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.ok === false) {
+    throw new Error(body.description ?? `Telegram sendVideo failed with ${response.status}`);
+  }
+  return body;
+};
+
 export const telegramRequest = async (method, payload = {}) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {

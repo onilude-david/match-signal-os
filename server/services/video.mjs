@@ -129,20 +129,83 @@ export const buildClipPlans = ({ fixture = {}, prediction = {}, content = {} }) 
   });
 };
 
+// Runtime-probe an encoder by actually trying to encode 1 frame of testsrc.
+// FFmpeg may *advertise* `h264_nvenc` because it was compiled in, but the
+// runtime can still fail on hardware without an NVENC silicon block (e.g.
+// the NVIDIA MX-series, where CUDA cores exist but video engine doesn't).
+// We cache the result for the lifetime of the process so we never pay this
+// probe more than once.
+const encoderProbeCache = new Map(); // name -> { ok, error? }
+
+async function probeEncoderRuntime(name, extraArgs = []) {
+  if (encoderProbeCache.has(name)) return encoderProbeCache.get(name);
+  const args = [
+    "-y", "-hide_banner", "-nostats",
+    "-f", "lavfi",
+    "-i", "color=c=black:s=320x180:d=0.04:r=25",
+    "-frames:v", "1",
+    "-c:v", name,
+    ...extraArgs,
+    "-f", "null", "-",
+  ];
+  try {
+    await execFileAsync("ffmpeg", args, { timeout: 12_000 });
+    const result = { ok: true };
+    encoderProbeCache.set(name, result);
+    return result;
+  } catch (error) {
+    const tail = (error.stderr || error.message || "")
+      .split(/\r?\n/).filter(Boolean).slice(-2).join(" / ");
+    const result = { ok: false, error: tail };
+    encoderProbeCache.set(name, result);
+    return result;
+  }
+}
+
 export const ffmpegHealth = async () => {
   try {
     const { stdout: versionOut } = await execFileAsync("ffmpeg", ["-version"], { timeout: 8000 });
     const { stdout: encodersOut } = await execFileAsync("ffmpeg", ["-encoders"], { timeout: 8000 });
     const version = versionOut.split(/\r?\n/)[0];
-    const hasNvenc = encodersOut.includes("h264_nvenc");
-    const hasAmf = encodersOut.includes("h264_amf");
+
+    // Candidate GPU encoders that the build advertises.
+    const candidates = [
+      { name: "h264_nvenc",  present: encodersOut.includes("h264_nvenc") },
+      { name: "h264_amf",    present: encodersOut.includes("h264_amf") },
+      { name: "hevc_nvenc",  present: encodersOut.includes("hevc_nvenc") },
+      { name: "hevc_amf",    present: encodersOut.includes("hevc_amf") },
+      { name: "av1_nvenc",   present: encodersOut.includes("av1_nvenc") },
+      { name: "av1_amf",     present: encodersOut.includes("av1_amf") },
+    ];
+
+    // Runtime-validate each candidate in parallel. The probes are tiny
+    // (~50ms each on a working encoder, ~500ms on a failure) so this barely
+    // costs anything per health check, and the result is cached anyway.
+    const probed = await Promise.all(
+      candidates.map(async (c) => {
+        if (!c.present) return { ...c, runtime: false };
+        const result = await probeEncoderRuntime(c.name);
+        return { ...c, runtime: result.ok, runtimeError: result.error ?? null };
+      }),
+    );
+
+    // Shape stays backwards-compatible with the existing render pipeline:
+    // each encoder key is a plain boolean. We also expose `runtimeChecks`
+    // with the per-encoder error so the UI can surface "why".
+    const encoders = {};
+    const runtimeChecks = {};
+    for (const p of probed) {
+      encoders[p.name] = p.runtime;
+      runtimeChecks[p.name] = { present: p.present, runtime: p.runtime, error: p.runtimeError };
+    }
+    const anyGpu = Object.values(encoders).some(Boolean);
+
     return {
       configured: true,
       version,
-      encoders: {
-        h264_nvenc: hasNvenc,
-        h264_amf: hasAmf,
-      },
+      encoders,
+      runtimeChecks,
+      gpuAvailable: anyGpu,
     };
   } catch (error) {
     return { configured: false, error: error.message };

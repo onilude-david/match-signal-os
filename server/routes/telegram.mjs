@@ -1,7 +1,11 @@
 import express from "express";
 import { assertEnv, jsonError } from "../config/env.mjs";
+import path from "node:path";
+import { access } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import {
   telegramSendMessage,
+  telegramSendVideo,
   telegramRequest,
   telegramPolling,
   handleTelegramUpdate,
@@ -175,6 +179,87 @@ router.post("/market-context", publicSafetyMiddleware, async (req, res) => {
   try {
     const result = await telegramSendMessage({ chatId, text, parseMode });
     res.json({ ok: true, result });
+  } catch (error) {
+    jsonError(res, 502, error.message);
+  }
+});
+
+// POST /api/telegram/clip
+// Publish a locally-rendered video clip to a Telegram destination.
+// Body: { videoPath, caption?, parseMode?, target?: "admin"|"public"|"vip", duration?, width?, height? }
+//
+// Path resolution: we accept either an absolute path or a path relative to
+// the project root. Public-safety filter applies to the caption before any
+// upload happens.
+router.post("/clip", async (req, res) => {
+  if (!assertEnv(res, "TELEGRAM_BOT_TOKEN")) return;
+
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const rootDir = path.resolve(__dirname, "../..");
+
+  const { videoPath: rawPath, caption = "", parseMode, target = "admin", duration, width, height } = req.body ?? {};
+  if (!rawPath) {
+    jsonError(res, 400, "videoPath is required.");
+    return;
+  }
+
+  // Caption guard — same gate as text routes.
+  if (caption) {
+    const verdict = publicSafetyCheck(caption);
+    if (!verdict.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: "Public-safety filter rejected the caption.",
+        verdict,
+      });
+    }
+  }
+
+  // Choose destination channel id by target.
+  let chatId;
+  if (target === "public") {
+    chatId = process.env.TELEGRAM_PUBLIC_CHANNEL_ID;
+    if (!chatId) return jsonError(res, 501, "TELEGRAM_PUBLIC_CHANNEL_ID is not configured.");
+  } else if (target === "vip") {
+    chatId = process.env.TELEGRAM_BETTING_CHANNEL_ID;
+    if (!chatId) return jsonError(res, 501, "TELEGRAM_BETTING_CHANNEL_ID is not configured.");
+    if (!vipPublishingEnabled()) {
+      return res.status(403).json({
+        ok: false,
+        error: "VIP publishing is not enabled.",
+        hint: "Set VIP_JURISDICTIONS and VIP_PUBLISH_ENABLED!=false in .env.",
+      });
+    }
+  } else {
+    chatId = process.env.TELEGRAM_ADMIN_CHAT_ID;
+    if (!chatId) return jsonError(res, 501, "TELEGRAM_ADMIN_CHAT_ID is not configured.");
+  }
+
+  // Resolve videoPath: absolute or root-relative.
+  const videoPath = path.isAbsolute(rawPath) ? rawPath : path.resolve(rootDir, rawPath);
+  try {
+    await access(videoPath);
+  } catch {
+    return jsonError(res, 404, `Video file not found at ${videoPath}`);
+  }
+
+  try {
+    const result = await telegramSendVideo({
+      chatId,
+      videoPath,
+      caption,
+      parseMode,
+      duration,
+      width,
+      height,
+    });
+    res.json({
+      ok: true,
+      target,
+      messageId: result.result?.message_id ?? null,
+      chatId: result.result?.chat?.id ?? chatId,
+      result,
+    });
   } catch (error) {
     jsonError(res, 502, error.message);
   }

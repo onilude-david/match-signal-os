@@ -63,12 +63,20 @@ import {
   ClipSuggestion,
   ScanResult,
   TranscriptCue,
+  VideoSourceCandidate,
+  VideoSourceSearchResponse,
+  YouTubeInfo,
+  YouTubeDownloadResult,
+  YouTubeStatus,
 } from "./types";
 
 // Import components
 import { Metric } from "./components/Metric";
 import { LabeledInput } from "./components/LabeledInput";
 import { ClipTimeline, TimelineThumb, TimelineWaveform } from "./components/ClipTimeline";
+import { ProgressBar } from "./components/ProgressBar";
+import { ClipRenderProgress } from "./components/ClipRenderProgress";
+import { useJobProgress } from "./hooks/useJobProgress";
 import { OutputPanel } from "./components/OutputPanel";
 import { TeamRatingEditor } from "./components/TeamRatingEditor";
 import { MatchIntelPanel } from "./components/MatchIntelPanel";
@@ -211,6 +219,27 @@ const socialKitFor = (fixture: Fixture, prediction: Prediction, marketContext: M
 };
 
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+const formatViews = (n: number) => {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+};
+
+// yt-dlp upload_date is "YYYYMMDD" — render as YYYY-MM-DD.
+const formatUploadDate = (d: string) => {
+  if (!d || d.length !== 8) return d;
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+};
+
+// Conservative check before we fire the auto-probe. Catches the formats
+// yt-dlp accepts (watch?v=, youtu.be/, /shorts/, /live/, /embed/).
+const looksLikeYouTubeUrl = (raw: string) => {
+  const url = raw.trim();
+  if (!url) return false;
+  return /(?:youtube\.com\/(?:watch\?|shorts\/|live\/|embed\/)|youtu\.be\/)/i.test(url);
+};
 
 const useStoredState = <T,>(key: string, fallback: T) => {
   const [value, setValue] = useState<T>(() => {
@@ -638,6 +667,10 @@ function App() {
   const [officialStandings, setOfficialStandings] = useState<StandingGroup[]>([]);
   const [matchIntel, setMatchIntel] = useState<Record<string, MatchIntel>>({});
   const [clipSourcePath, setClipSourcePath] = useStoredState("match-signal-clip-source", "");
+  const [sourceSearchQuery, setSourceSearchQuery] = useStoredState("match-signal-video-source-query", "");
+  const [videoSources, setVideoSources] = useState<VideoSourceCandidate[]>([]);
+  const [sourceProviderNote, setSourceProviderNote] = useState("");
+  const [sourceCatalog, setSourceCatalog] = useState<VideoSourceSearchResponse["catalog"]>([]);
   const [clipPlans, setClipPlans] = useState<ClipPlan[]>([]);
   const [selectedClipId, setSelectedClipId] = useState("");
   const [renderMode, setRenderMode] = useState<"rough" | "final">("final");
@@ -715,6 +748,23 @@ function App() {
   const [accentText, setAccentText] = useState("");
   const [gpuAcceleration, setGpuAcceleration] = useState(false);
   const [selectedJobsToMerge, setSelectedJobsToMerge] = useState<string[]>([]);
+
+  // Ship-to-channels state. We track per-job ship status so each queue card
+  // can render a small "✓ admin / ✗ public" row right after shipping.
+  type ShipDestination = "telegram-admin" | "telegram-public" | "telegram-vip";
+  const ALL_SHIP_DESTINATIONS: ShipDestination[] = ["telegram-admin", "telegram-public", "telegram-vip"];
+  const [shipDestinations, setShipDestinations] = useStoredState<ShipDestination[]>(
+    "match-signal-ship-destinations",
+    ["telegram-admin"],
+  );
+  // Map<job.id, { destination, ok, error?, messageId? }[]>
+  const [shipResults, setShipResults] = useState<Record<string, Array<{ destination: string; ok: boolean; error?: string; messageId?: number | null }>>>({});
+  const [shippingJobIds, setShippingJobIds] = useState<Record<string, boolean>>({});
+  const toggleShipDestination = (key: ShipDestination) => {
+    setShipDestinations((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
+    );
+  };
   const sourceVideoRef = React.useRef<HTMLVideoElement | null>(null);
 
   // Next-gen clip engine state
@@ -726,10 +776,28 @@ function App() {
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [transcriptCues, setTranscriptCues] = useState<TranscriptCue[]>([]);
   const [whisperConfigured, setWhisperConfigured] = useState<boolean | null>(null);
+  // null = not yet checked; true/false after the engine probe runs.
+  const [gpuAvailable, setGpuAvailable] = useState<boolean | null>(null);
   const [timelineThumbs, setTimelineThumbs] = useState<TimelineThumb[]>([]);
   const [timelineWave, setTimelineWave] = useState<TimelineWaveform | null>(null);
   const [timelineDuration, setTimelineDuration] = useState(0);
   const [timelineFps, setTimelineFps] = useState(30);
+
+  // YouTube source ingestion via yt-dlp
+  const [sourceMode, setSourceMode] = useStoredState<"local" | "youtube">("match-signal-source-mode", "local");
+  const [youtubeUrl, setYoutubeUrl] = useStoredState("match-signal-youtube-url", "");
+  const [youtubeInfo, setYoutubeInfo] = useState<YouTubeInfo | null>(null);
+  const [youtubeStatus, setYoutubeStatus] = useState<YouTubeStatus | null>(null);
+  // Optional segment trim "MM:SS-MM:SS" — only used for long videos so we
+  // don't pull a full 90-min broadcast when we want one ten-minute window.
+  const [youtubeSection, setYoutubeSection] = useStoredState("match-signal-youtube-section", "");
+  // Async download job id — subscribed via useJobProgress for live progress.
+  const [downloadJobId, setDownloadJobId] = useState<string | null>(null);
+  const downloadProgress = useJobProgress(downloadJobId);
+
+  // Per-clip render job ids. Each entry keys a ClipRenderProgress child that
+  // owns its own SSE subscription (avoids hooks-in-loop in the parent).
+  const [renderJobIds, setRenderJobIds] = useState<Record<string, string>>({});
 
   const toggleAspect = (key: AspectKey) => {
     setAspectSelection((prev) =>
@@ -932,28 +1000,157 @@ function App() {
     setLoading((prev) => ({ ...prev, checkVideoEngine: true }));
     type EngineStatus = {
       ok: boolean;
-      ffmpeg: { configured: boolean; version?: string; error?: string };
+      ffmpeg: {
+        configured: boolean;
+        version?: string;
+        error?: string;
+        gpuAvailable?: boolean;
+        runtimeChecks?: Record<string, { present: boolean; runtime: boolean; error: string | null }>;
+      };
       whisper?: { configured: boolean; modelPath: string };
       outputDir: string;
     };
     try {
       const result = await api<EngineStatus>("/api/video/status");
       setWhisperConfigured(result.whisper?.configured ?? false);
+      // Record GPU availability so the checkbox can be honest about whether
+      // hardware acceleration actually works on this machine.
+      setGpuAvailable(result.ffmpeg?.gpuAvailable ?? false);
       const ffmpegLine = result.ffmpeg.configured
         ? `FFmpeg: ${result.ffmpeg.version}`
         : `FFmpeg unavailable: ${result.ffmpeg.error}`;
+      const gpuLine = result.ffmpeg.configured
+        ? result.ffmpeg.gpuAvailable ? "GPU: ready" : "GPU: none (using libx264)"
+        : "";
       const whisperLine = result.whisper
         ? result.whisper.configured
           ? "Whisper: ready"
           : "Whisper: model missing"
         : "Whisper: unknown";
-      setApiMessage(`${ffmpegLine} · ${whisperLine}`);
+      setApiMessage([ffmpegLine, gpuLine, whisperLine].filter(Boolean).join(" · "));
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Video engine check failed");
     } finally {
       setLoading((prev) => ({ ...prev, checkVideoEngine: false }));
     }
   };
+
+  // ----- YouTube ingestion via yt-dlp ---------------------------------------
+  // Probe runs automatically on URL change (see the debounced effect below);
+  // the only manual action the operator takes is the single "Get video"
+  // button which downloads and hands off to the rest of the pipeline.
+
+  const downloadYouTube = async () => {
+    const url = youtubeUrl.trim();
+    if (!url) {
+      setApiMessage("Paste a YouTube URL first");
+      return;
+    }
+    // Async path: server returns a jobId; SSE drives the progress bar.
+    setDownloadJobId(null);
+    try {
+      const sectionRange = youtubeSection.trim() || null;
+      const result = await api<{ ok: boolean; jobId: string }>(
+        "/api/video/youtube/download/start",
+        {
+          method: "POST",
+          body: JSON.stringify({ url, maxHeight: 1080, sectionRange }),
+        },
+      );
+      setDownloadJobId(result.jobId);
+      setApiMessage("Download started — watching progress…");
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "YouTube download failed");
+    }
+  };
+
+  // When the async download finishes, hand the new source path off to the
+  // rest of the pipeline. Runs once per job-id completion.
+  useEffect(() => {
+    if (downloadProgress.status !== "done" || !downloadProgress.result) return;
+    const payload = downloadProgress.result as YouTubeDownloadResult;
+    setClipSourcePath(payload.sourceRelPath);
+    setYoutubeInfo(payload.info);
+    setApiMessage(
+      payload.cached
+        ? `Using cached ${payload.info.title}`
+        : `Downloaded ${payload.info.title}`,
+    );
+    void probeVideoSource(payload.sourceRelPath);
+    // We deliberately do not clear downloadJobId here so the green "Complete"
+    // bar stays visible. It clears on the next download.
+  }, [downloadProgress.status, downloadProgress.result?.id]);
+
+  // Surface download errors in the toast.
+  useEffect(() => {
+    if (downloadProgress.status === "error" && downloadProgress.error) {
+      setApiMessage(`Download failed: ${downloadProgress.error}`);
+    }
+  }, [downloadProgress.status, downloadProgress.error]);
+
+  // Pull yt-dlp install state alongside the engine check.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await api<{ ok: boolean; youtube: YouTubeStatus }>("/api/video/youtube/status");
+        if (!cancelled) setYoutubeStatus(result.youtube);
+      } catch {
+        if (!cancelled) setYoutubeStatus({ configured: false, kind: "missing", version: null, suggestion: null });
+      }
+    })();
+    // Also probe ffmpeg/whisper/gpu on mount so the GPU checkbox renders
+    // honestly without the operator needing to click "Engine status".
+    (async () => {
+      try {
+        const status = await api<{ ok: boolean; ffmpeg: { gpuAvailable?: boolean }; whisper?: { configured: boolean } }>(
+          "/api/video/status",
+        );
+        if (cancelled) return;
+        setGpuAvailable(status.ffmpeg?.gpuAvailable ?? false);
+        setWhisperConfigured(status.whisper?.configured ?? false);
+      } catch {
+        if (!cancelled) setGpuAvailable(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Auto-probe on URL change. Debounce by 600ms so we don't hammer yt-dlp
+  // while the user is mid-paste. Cancels in-flight when the URL changes.
+  useEffect(() => {
+    if (sourceMode !== "youtube") return;
+    if (!youtubeStatus?.configured) return;
+    if (!looksLikeYouTubeUrl(youtubeUrl)) {
+      // Clear the card if the URL is no longer plausibly a YouTube URL.
+      if (youtubeInfo && !youtubeUrl.trim()) setYoutubeInfo(null);
+      return;
+    }
+    // Don't re-probe if the card already matches the current URL.
+    if (youtubeInfo && youtubeUrl.includes(youtubeInfo.id)) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setLoading((prev) => ({ ...prev, probeYouTube: true }));
+      try {
+        const result = await api<{ ok: boolean; info: YouTubeInfo }>("/api/video/youtube/probe", {
+          method: "POST",
+          body: JSON.stringify({ url: youtubeUrl.trim() }),
+        });
+        if (!cancelled) setYoutubeInfo(result.info);
+      } catch {
+        // Silent — the user will see the error on download attempt.
+        if (!cancelled) setYoutubeInfo(null);
+      } finally {
+        if (!cancelled) setLoading((prev) => ({ ...prev, probeYouTube: false }));
+      }
+    }, 600);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [youtubeUrl, sourceMode, youtubeStatus?.configured]);
 
   const loadTimelineAssets = async (targetPath: string) => {
     setLoading((prev) => ({ ...prev, timelineAssets: true }));
@@ -1008,6 +1205,30 @@ function App() {
     }
   };
 
+  const searchFootageSources = async () => {
+    const query = sourceSearchQuery.trim() || `${selectedFixture.teamA} ${selectedFixture.teamB}`;
+    setLoading((prev) => ({ ...prev, sourceSearch: true }));
+    try {
+      const params = new URLSearchParams({
+        query,
+        limit: "18",
+      });
+      const result = await api<VideoSourceSearchResponse>(`/api/video/sources/search?${params.toString()}`);
+      setVideoSources(result.sources);
+      setSourceCatalog(result.catalog ?? []);
+      const providerText = result.providers
+        .map((provider) => `${provider.label}: ${provider.mode.replace("_", " ")}, ${provider.rightsMode.replace("_", " ")}`)
+        .join(" · ");
+      setSourceProviderNote(providerText);
+      const errorText = result.errors.length ? ` (${result.errors.map((error) => `${error.provider}: ${error.message}`).join("; ")})` : "";
+      setApiMessage(`Found ${result.sources.length} video source candidate(s)${errorText}`);
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "Video source search failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, sourceSearch: false }));
+    }
+  };
+
   const createSampleVideo = async () => {
     setLoading((prev) => ({ ...prev, createSample: true }));
     try {
@@ -1032,9 +1253,14 @@ function App() {
       setApiMessage("Pick at least one aspect ratio before rendering");
       return;
     }
+    // Already rendering? Bail out — the user is just impatient.
+    if (renderJobIds[clip.id]) {
+      setApiMessage("This clip is already rendering — watch the progress bar.");
+      return;
+    }
     setRenderingClipId(clip.id);
     try {
-      const result = await api<{ ok: boolean; jobs: RenderJob[] }>("/api/clips/render", {
+      const result = await api<{ ok: boolean; jobId: string }>("/api/clips/render/start", {
         method: "POST",
         body: JSON.stringify({
           sourcePath: clipSourcePath,
@@ -1054,14 +1280,72 @@ function App() {
           gpuAcceleration,
         }),
       });
-      setRenderJobs([...result.jobs, ...renderJobs].slice(0, 24));
-      const aspectCount = result.jobs.length;
-      setApiMessage(`Rendered ${clip.preset} in ${aspectCount} aspect${aspectCount === 1 ? "" : "s"}`);
+      setRenderJobIds((prev) => ({ ...prev, [clip.id]: result.jobId }));
+      setApiMessage(`Rendering ${clip.preset} — watching ffmpeg progress…`);
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Clip render failed");
     } finally {
       setRenderingClipId("");
     }
+  };
+
+  // Batch: fire renderClip for every clip plan that isn't already rendering.
+  // The async endpoint returns a jobId immediately, so this is a fast loop —
+  // the actual ffmpeg work happens in parallel in the background and each
+  // card animates its own progress bar.
+  const renderAllClips = async () => {
+    if (!clipSourcePath.trim()) {
+      setApiMessage("Add a source video path before rendering");
+      return;
+    }
+    if (aspectSelection.length === 0) {
+      setApiMessage("Pick at least one aspect ratio before rendering");
+      return;
+    }
+    const pending = clipPlans.filter(
+      (c) => !renderJobIds[c.id] && Math.max(0, c.endTime - c.startTime) > 0.4,
+    );
+    if (pending.length === 0) {
+      setApiMessage("Nothing to render — every clip is already in flight or has zero duration.");
+      return;
+    }
+    setApiMessage(`Queueing ${pending.length} render${pending.length === 1 ? "" : "s"}…`);
+    // Sequential POST so the jobs land in order, but ffmpeg work runs in
+    // parallel because each /start returns instantly.
+    for (const clip of pending) {
+      // eslint-disable-next-line no-await-in-loop
+      await renderClip(clip);
+    }
+  };
+
+  // Called by ClipRenderProgress when an SSE job finishes. Merges the
+  // resulting per-aspect RenderJobs into the queue and clears the in-flight
+  // jobId so the user can re-render the same clip plan again.
+  const handleRenderDone = (clipId: string, payload: { jobs?: RenderJob[] } | null) => {
+    if (payload?.jobs?.length) {
+      setRenderJobs((prev) => [...payload.jobs!, ...prev].slice(0, 24));
+      setApiMessage(
+        `Rendered ${payload.jobs.length} aspect${payload.jobs.length === 1 ? "" : "s"}`,
+      );
+    }
+    // Keep the "Complete" bar visible for ~6s, then clear so the card
+    // becomes re-renderable.
+    window.setTimeout(() => {
+      setRenderJobIds((prev) => {
+        const next = { ...prev };
+        delete next[clipId];
+        return next;
+      });
+    }, 6_000);
+  };
+
+  const handleRenderError = (clipId: string, message: string) => {
+    setApiMessage(`Render failed: ${message}`);
+    setRenderJobIds((prev) => {
+      const next = { ...prev };
+      delete next[clipId];
+      return next;
+    });
   };
 
   const scanForMoments = async () => {
@@ -1129,6 +1413,65 @@ function App() {
       ),
     );
     setApiMessage(`Applied auto-suggestion (${suggestion.type}, score ${suggestion.score.toFixed(2)})`);
+  };
+
+  // Ship a single rendered RenderJob to every destination currently selected.
+  // Captions default to "<teamA> vs <teamB> — <title>"; the caller can override.
+  const shipClip = async (job: RenderJob, captionOverride?: string) => {
+    if (!shipDestinations.length) {
+      setApiMessage("Pick at least one destination first.");
+      return;
+    }
+    setShippingJobIds((prev) => ({ ...prev, [job.id]: true }));
+    try {
+      const caption = captionOverride ?? `${selectedFixture.teamA} vs ${selectedFixture.teamB} — ${job.title}`;
+      const payload = {
+        items: [{
+          publicUrl: job.publicUrl,
+          caption,
+          duration: job.duration,
+          width: job.width ?? null,
+          height: job.height ?? null,
+        }],
+        destinations: shipDestinations,
+      };
+      const result = await api<{
+        ok: boolean;
+        summary: { total: number; ok: number; failed: number };
+        results: Array<{ destination: string; ok: boolean; error?: string; messageId?: number | null }>;
+      }>("/api/clips/ship", { method: "POST", body: JSON.stringify(payload) });
+      setShipResults((prev) => ({ ...prev, [job.id]: result.results }));
+      setApiMessage(
+        `Shipped ${job.aspect ?? "clip"}: ${result.summary.ok} ok · ${result.summary.failed} failed`,
+      );
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "Ship failed");
+    } finally {
+      setShippingJobIds((prev) => {
+        const next = { ...prev };
+        delete next[job.id];
+        return next;
+      });
+    }
+  };
+
+  // Ship every rendered clip in the queue to all selected destinations.
+  // One round-trip per clip so each card lights up its own status row as
+  // the responses arrive.
+  const shipAllClips = async () => {
+    if (!renderJobs.length) {
+      setApiMessage("Nothing to ship — render some clips first.");
+      return;
+    }
+    if (!shipDestinations.length) {
+      setApiMessage("Pick at least one destination first.");
+      return;
+    }
+    setApiMessage(`Shipping ${renderJobs.length} clip${renderJobs.length === 1 ? "" : "s"} to ${shipDestinations.length} destination${shipDestinations.length === 1 ? "" : "s"}…`);
+    for (const job of renderJobs) {
+      // eslint-disable-next-line no-await-in-loop
+      await shipClip(job);
+    }
   };
 
   const mergeClips = async () => {
@@ -2722,25 +3065,217 @@ function App() {
               {/* Left column: source + plans */}
               <article className="flex flex-col gap-10 min-w-0">
                 <div>
-                  <p className="eyebrow pitch">Source</p>
-                  <h2 className="mt-1 text-ink pb-3 border-b border-[var(--rule-strong)]">Local footage</h2>
-                  <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-x-4 gap-y-3 items-end">
+                  <p className="eyebrow gold">Source hub</p>
+                  <h2 className="mt-1 text-ink pb-3 border-b border-[var(--rule-strong)]">Official video discovery</h2>
+                  <p className="mt-3 max-w-[72ch] text-[0.92rem] leading-[1.55] text-[var(--ink-muted)]">
+                    Search official highlight embeds first. These are reference/embed sources unless the provider explicitly grants downloadable editing rights.
+                  </p>
+                  <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-x-4 gap-y-3 items-end">
                     <label className="field">
-                      <span>Source video path</span>
+                      <span>Search match, team, or competition</span>
                       <input
-                        value={clipSourcePath}
-                        onChange={(event) => setClipSourcePath(event.target.value)}
-                        placeholder="C:\\Videos\\match-footage.mp4"
-                        className="font-mono"
+                        value={sourceSearchQuery}
+                        onChange={(event) => setSourceSearchQuery(event.target.value)}
+                        placeholder={`${selectedFixture.teamA} ${selectedFixture.teamB}`}
                       />
                     </label>
-                    <Button variant="secondary" icon={<Film size={14} />} onClick={() => probeVideoSource()} loading={loading.probeVideo}>
-                      Probe
-                    </Button>
-                    <Button variant="secondary" icon={<Radar size={14} />} onClick={scanForMoments} loading={loading.scan}>
-                      Scan for moments
+                    <Button variant="secondary" icon={<Search size={14} />} onClick={searchFootageSources} loading={loading.sourceSearch}>
+                      Search sources
                     </Button>
                   </div>
+                  {sourceProviderNote && <p className="caption mt-2">{sourceProviderNote}</p>}
+
+                  {sourceCatalog && sourceCatalog.length > 0 && (
+                    <details className="mt-3 border-y border-[var(--rule)] py-3">
+                      <summary className="caption cursor-pointer">Provider map · editable feeds require licenses</summary>
+                      <div className="mt-3 grid gap-0">
+                        {sourceCatalog.map((provider) => (
+                          <div key={provider.key} className="grid grid-cols-1 md:grid-cols-[160px_150px_minmax(0,1fr)_auto] gap-2 md:gap-4 py-3 border-t border-[var(--rule)]">
+                            <strong className="text-[0.9rem] text-ink">{provider.label}</strong>
+                            <span className="caption">{provider.status.replace(/_/g, " ")}</span>
+                            <span className="text-[0.8rem] text-[var(--ink-muted)]">{provider.note}</span>
+                            <a className="caption text-pitch" href={provider.docs} target="_blank" rel="noreferrer">Docs</a>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+
+                  {videoSources.length > 0 && (
+                    <div className="mt-4 grid gap-0 border-t border-[var(--rule)]">
+                      {videoSources.map((source) => (
+                        <article key={source.id} className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-4 py-4 border-b border-[var(--rule)]">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                              <h3 className="text-[1rem] font-medium text-ink font-display [font-variation-settings:'opsz'_60]">{source.matchTitle || source.title}</h3>
+                              <span className={`caption ${source.editable ? "pitch" : "gold"}`}>{source.rightsLabel}</span>
+                            </div>
+                            <p className="mt-1 text-[0.86rem] text-[var(--ink-muted)]">{source.title} · {source.competition || "Competition unknown"} · {source.date || "Date unknown"}</p>
+                            <p className="mt-2 text-[0.8rem] text-[var(--ink-muted)]">{source.reason}</p>
+                          </div>
+                          <div className="flex flex-wrap md:justify-end gap-2">
+                            {source.sourceUrl && (
+                              <a className="button-link" href={source.sourceUrl} target="_blank" rel="noreferrer">Open source</a>
+                            )}
+                            {source.embed && (
+                              <Button variant="ghost" icon={<Clipboard size={13} />} onClick={() => copy("Source Embed", source.embed || "")}>
+                                Copy embed
+                              </Button>
+                            )}
+                            <Button
+                              variant="ghost"
+                              icon={<ShieldCheck size={13} />}
+                              onClick={() => setApiMessage(source.notes)}
+                            >
+                              Rights note
+                            </Button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <p className="eyebrow pitch">Source</p>
+                  <h2 className="mt-1 text-ink pb-3 border-b border-[var(--rule-strong)]">Footage</h2>
+
+                  {/* Source mode toggle */}
+                  <div className="mt-4 inline-flex border border-[var(--rule)]">
+                    {(["local", "youtube"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setSourceMode(mode)}
+                        className={`px-4 py-2 text-[0.875rem] tracking-[0.02em] uppercase font-medium transition-colors ${
+                          sourceMode === mode
+                            ? "bg-[var(--ink)] text-[var(--paper)]"
+                            : "text-[var(--ink-muted)] hover:text-ink"
+                        }`}
+                      >
+                        {mode === "local" ? "Local file" : "YouTube URL"}
+                      </button>
+                    ))}
+                  </div>
+
+                  {sourceMode === "youtube" ? (
+                    <>
+                      <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-x-4 gap-y-3 items-end">
+                        <label className="field">
+                          <span>YouTube URL · paste to auto-probe</span>
+                          <input
+                            value={youtubeUrl}
+                            onChange={(event) => setYoutubeUrl(event.target.value)}
+                            placeholder="https://www.youtube.com/watch?v=…"
+                            className="font-mono"
+                          />
+                        </label>
+                        <Button
+                          variant="primary"
+                          icon={<Download size={14} />}
+                          onClick={downloadYouTube}
+                          loading={downloadProgress.status === "pending" || downloadProgress.status === "running"}
+                          disabled={!youtubeStatus?.configured || !looksLikeYouTubeUrl(youtubeUrl) || downloadProgress.status === "running"}
+                        >
+                          {downloadProgress.status === "running"
+                            ? `Downloading ${downloadProgress.progress?.percent != null ? downloadProgress.progress.percent.toFixed(0) + "%" : "…"}`
+                            : "Get video"}
+                        </Button>
+                      </div>
+
+                      {/* Live progress bar — only renders when a job is active or just finished. */}
+                      <ProgressBar state={downloadProgress} label="yt-dlp" />
+
+                      {!youtubeStatus?.configured && (
+                        <p className="mt-3 text-[0.8rem] text-[var(--ink-muted)] leading-[1.55]">
+                          yt-dlp not detected. Install it with <code className="font-mono text-ink">pip install --user yt-dlp</code>, <code className="font-mono text-ink">winget install yt-dlp</code>, or <code className="font-mono text-ink">brew install yt-dlp</code>, then restart the API.
+                        </p>
+                      )}
+                      {youtubeStatus?.configured && (
+                        <p className="mt-2 text-[0.75rem] text-[var(--ink-quiet)] tracking-[0.02em]">
+                          yt-dlp {youtubeStatus.version} · {youtubeStatus.kind}
+                          {loading.probeYouTube ? " · reading metadata…" : ""}
+                        </p>
+                      )}
+
+                      {/* Section trim — only useful for long broadcasts. Surfaces
+                          automatically when the auto-probe reports duration > 5 min. */}
+                      {youtubeInfo && youtubeInfo.duration > 300 && (
+                        <label className="field mt-4 max-w-[420px]">
+                          <span>
+                            Trim section before download (optional) · long video, {Math.floor(youtubeInfo.duration / 60)} min
+                          </span>
+                          <input
+                            value={youtubeSection}
+                            onChange={(event) => setYoutubeSection(event.target.value)}
+                            placeholder="e.g. 12:00-22:00"
+                            className="font-mono"
+                          />
+                        </label>
+                      )}
+
+                      {youtubeInfo && (
+                        <article className="mt-5 grid grid-cols-[160px_minmax(0,1fr)] gap-x-5 gap-y-2 border-t border-[var(--rule)] pt-5">
+                          {youtubeInfo.thumbnail ? (
+                            <img
+                              src={youtubeInfo.thumbnail}
+                              alt=""
+                              className="w-full aspect-video object-cover border border-[var(--rule)]"
+                            />
+                          ) : (
+                            <div className="w-full aspect-video bg-[var(--paper-raised)] border border-[var(--rule)]" />
+                          )}
+                          <div className="flex flex-col gap-1 min-w-0">
+                            <p className="eyebrow gold">{youtubeInfo.channel}</p>
+                            <h3 className="text-ink font-display [font-variation-settings:'opsz'_60] text-[1.1rem] leading-tight">
+                              {youtubeInfo.title}
+                            </h3>
+                            <p className="caption">
+                              <span className="figure text-ink tabular-nums">
+                                {Math.floor(youtubeInfo.duration / 60)}:{String(Math.round(youtubeInfo.duration % 60)).padStart(2, "0")}
+                              </span>
+                              {youtubeInfo.viewCount ? ` · ${formatViews(youtubeInfo.viewCount)} views` : ""}
+                              {youtubeInfo.uploadDate ? ` · ${formatUploadDate(youtubeInfo.uploadDate)}` : ""}
+                              {youtubeInfo.isLive ? " · LIVE — wait for VOD" : ""}
+                            </p>
+                            {youtubeInfo.description && (
+                              <p className="text-[0.8rem] text-[var(--ink-muted)] leading-[1.5] max-w-[60ch] mt-1 line-clamp-3">
+                                {youtubeInfo.description}
+                              </p>
+                            )}
+                          </div>
+                        </article>
+                      )}
+                    </>
+                  ) : (
+                    <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-x-4 gap-y-3 items-end">
+                      <label className="field">
+                        <span>Source video path</span>
+                        <input
+                          value={clipSourcePath}
+                          onChange={(event) => setClipSourcePath(event.target.value)}
+                          placeholder="C:\\Videos\\match-footage.mp4"
+                          className="font-mono"
+                        />
+                      </label>
+                      <Button variant="secondary" icon={<Film size={14} />} onClick={() => probeVideoSource()} loading={loading.probeVideo}>
+                        Probe
+                      </Button>
+                      <Button variant="secondary" icon={<Radar size={14} />} onClick={scanForMoments} loading={loading.scan}>
+                        Scan for moments
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* Once a source is chosen (either mode), expose the Scan button below
+                      so YouTube workflows can scan after download. */}
+                  {sourceMode === "youtube" && clipSourcePath.trim() && (
+                    <div className="mt-4">
+                      <Button variant="secondary" icon={<Radar size={14} />} onClick={scanForMoments} loading={loading.scan}>
+                        Scan for moments
+                      </Button>
+                    </div>
+                  )}
 
                   {clipSourcePath.trim() && (
                     <div className="mt-6 flex flex-col gap-3">
@@ -2945,26 +3480,59 @@ function App() {
                     </div>
                   </div>
 
-                  <label className="mt-5 flex items-center gap-2 text-[0.875rem] text-[var(--ink-muted)] cursor-pointer select-none">
+                  <label
+                    className={`mt-5 flex items-center gap-2 text-[0.875rem] select-none ${
+                      gpuAvailable === false ? "text-[var(--ink-quiet)] cursor-not-allowed" : "text-[var(--ink-muted)] cursor-pointer"
+                    }`}
+                    title={
+                      gpuAvailable === false
+                        ? "FFmpeg runtime probe found no working NVENC/AMF encoder on this machine — likely an MX-series GPU with no video block, or no AMD GPU. Renders run on libx264."
+                        : gpuAvailable === null
+                        ? "Click 'Engine status' to probe GPU encoders."
+                        : "NVENC / AMF detected — renders use it; CPU fallback engages on per-render failure."
+                    }
+                  >
                     <input
                       type="checkbox"
                       id="gpu-accel"
-                      checked={gpuAcceleration}
+                      checked={gpuAcceleration && gpuAvailable !== false}
                       onChange={(e) => setGpuAcceleration(e.target.checked)}
+                      disabled={gpuAvailable === false}
                       className="h-4 w-4 cursor-pointer"
                       style={{ accentColor: "var(--ink)" }}
                     />
-                    Use GPU hardware acceleration (NVENC / AMF, falls back to libx264 if the chain refuses)
+                    {gpuAvailable === false
+                      ? "GPU acceleration · not available on this machine (using libx264)"
+                      : "Use GPU hardware acceleration (NVENC / AMF)"}
                   </label>
                 </div>
 
                 <div>
-                  <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                  <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)] gap-4 flex-wrap">
                     <div>
                       <p className="eyebrow pitch">Clip plans</p>
                       <h2 className="mt-1 text-ink">Suggested cuts</h2>
                     </div>
-                    <span className="caption">{clipPlans.length} plans</span>
+                    <div className="flex items-center gap-3">
+                      <span className="caption">
+                        {Object.keys(renderJobIds).length > 0
+                          ? `Rendering ${Object.keys(renderJobIds).length} of ${clipPlans.length}`
+                          : `${clipPlans.length} plan${clipPlans.length === 1 ? "" : "s"}`}
+                      </span>
+                      <Button
+                        variant="primary"
+                        icon={<Scissors size={13} />}
+                        onClick={renderAllClips}
+                        disabled={
+                          !clipSourcePath.trim() ||
+                          aspectSelection.length === 0 ||
+                          clipPlans.length === 0 ||
+                          clipPlans.every((c) => Boolean(renderJobIds[c.id]))
+                        }
+                      >
+                        Render all
+                      </Button>
+                    </div>
                   </div>
                   <div className="clip-plan-list">
                     {clipPlans.map((clip) => (
@@ -2993,10 +3561,17 @@ function App() {
                             event.stopPropagation();
                             void renderClip(clip);
                           }}
-                          loading={renderingClipId === clip.id}
+                          loading={renderingClipId === clip.id || Boolean(renderJobIds[clip.id])}
+                          disabled={Boolean(renderJobIds[clip.id])}
                         >
-                          {renderingClipId === clip.id ? "Rendering" : "Render"}
+                          {renderJobIds[clip.id] ? "Rendering…" : renderingClipId === clip.id ? "Starting" : "Render"}
                         </Button>
+                        {/* Live ffmpeg progress for this clip's render. */}
+                        <ClipRenderProgress
+                          jobId={renderJobIds[clip.id] ?? null}
+                          onDone={(payload) => handleRenderDone(clip.id, payload)}
+                          onError={(message) => handleRenderError(clip.id, message)}
+                        />
                       </article>
                     ))}
                     {clipPlans.length === 0 && (
@@ -3008,21 +3583,56 @@ function App() {
 
               {/* Right column: output queue */}
               <aside className="min-w-0">
-                <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)] gap-3 flex-wrap">
                   <div>
                     <p className="eyebrow pitch">Rendered clips</p>
                     <h2 className="mt-1 text-ink">Output queue</h2>
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 items-center">
                     {selectedJobsToMerge.length >= 2 && (
                       <Button variant="primary" icon={<Layers size={13} />} onClick={mergeClips} loading={loading.mergeClips}>
                         Merge ({selectedJobsToMerge.length})
                       </Button>
                     )}
-                    <Button variant="danger" icon={<Trash2 size={13} />} onClick={() => { setRenderJobs([]); setSelectedJobsToMerge([]); }}>
+                    <Button
+                      variant="primary"
+                      icon={<Send size={13} />}
+                      onClick={shipAllClips}
+                      disabled={!renderJobs.length || !shipDestinations.length || Object.keys(shippingJobIds).length > 0}
+                    >
+                      Ship all
+                    </Button>
+                    <Button variant="danger" icon={<Trash2 size={13} />} onClick={() => { setRenderJobs([]); setSelectedJobsToMerge([]); setShipResults({}); }}>
                       Clear
                     </Button>
                   </div>
+                </div>
+
+                {/* Destination chip strip — persisted in localStorage. */}
+                <div className="mt-3 flex items-center gap-x-2 gap-y-1 flex-wrap pb-3 border-b border-[var(--rule)]">
+                  <span className="caption">Ship to:</span>
+                  {ALL_SHIP_DESTINATIONS.map((key) => {
+                    const labels: Record<ShipDestination, string> = {
+                      "telegram-admin": "Telegram admin",
+                      "telegram-public": "Telegram public",
+                      "telegram-vip": "Telegram VIP",
+                    };
+                    const active = shipDestinations.includes(key);
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => toggleShipDestination(key)}
+                        className={`px-3 py-1 text-[0.75rem] uppercase tracking-[0.04em] border transition-colors ${
+                          active
+                            ? "border-[var(--ink)] bg-[var(--paper-raised)] text-ink"
+                            : "border-[var(--rule)] text-[var(--ink-muted)] hover:border-[var(--ink-muted)]"
+                        }`}
+                      >
+                        {labels[key]}
+                      </button>
+                    );
+                  })}
                 </div>
                 {renderJobs.length ? (
                   <div className="render-list">
@@ -3059,11 +3669,48 @@ function App() {
                               {job.gpuFallback ? " · GPU→CPU fallback" : ""}
                             </p>
                             <a href={job.publicUrl} target="_blank" rel="noreferrer">Open clip</a>
-                            {job.command && (
-                              <Button variant="ghost" icon={<Clipboard size={12} />} onClick={() => copy("Render Command", job.command!.join(" "))}>
-                                Copy command
+                            <div className="flex gap-2 flex-wrap items-center">
+                              <Button
+                                variant="primary"
+                                icon={<Send size={12} />}
+                                onClick={() => shipClip(job)}
+                                loading={shippingJobIds[job.id]}
+                                disabled={!shipDestinations.length || shippingJobIds[job.id]}
+                              >
+                                Ship
                               </Button>
-                            )}
+                              {job.command && (
+                                <Button variant="ghost" icon={<Clipboard size={12} />} onClick={() => copy("Render Command", job.command!.join(" "))}>
+                                  Copy command
+                                </Button>
+                              )}
+                            </div>
+
+                            {/* Ship results per destination — gold check for success,
+                                red dot + tooltip on the error message for failures. */}
+                            {shipResults[job.id]?.length ? (
+                              <div className="flex flex-wrap gap-2 pt-1 text-[0.7rem] tracking-[0.04em] uppercase">
+                                {shipResults[job.id].map((r, i) => {
+                                  const labels: Record<string, string> = {
+                                    "telegram-admin": "tg/admin",
+                                    "telegram-public": "tg/public",
+                                    "telegram-vip": "tg/vip",
+                                  };
+                                  const label = labels[r.destination] ?? r.destination;
+                                  return (
+                                    <span
+                                      key={`${r.destination}-${i}`}
+                                      title={r.error || (r.messageId ? `Message #${r.messageId}` : "")}
+                                      className="flex items-center gap-1 border border-[var(--rule)] px-2 py-0.5"
+                                      style={{ color: r.ok ? "var(--pitch)" : "var(--red)" }}
+                                    >
+                                      <span>{r.ok ? "✓" : "✗"}</span>
+                                      <span className="text-[var(--ink-muted)]">{label}</span>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            ) : null}
                           </div>
                         </article>
                       );

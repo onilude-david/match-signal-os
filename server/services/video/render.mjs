@@ -16,7 +16,7 @@
 //   artifacts/clips/<matchId>/<clipType>/<basename>.1x1.mp4
 //   ... etc.
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -119,22 +119,26 @@ function buildLoudnormFilter(measured) {
 // caller asked for GPU. AV1 is a separate opt-in (smaller files, slower
 // decoders on the receiving side, so default to H.264).
 
+// Each encoder choice also signals which hardware decode path makes sense.
+// `hwaccel === "cuda"` pairs with NVENC; `d3d11va` pairs with AMF on Windows.
+// CPU encoders return `hwaccel: null` so we never pay an upload/download cost
+// just to feed pixels back to libx264.
 function pickEncoder({ gpu, codec = "h264", encoders = {} }) {
   if (gpu) {
     if (codec === "av1") {
-      if (encoders.av1_nvenc) return { name: "av1_nvenc", args: ["-c:v", "av1_nvenc", "-preset", "p4", "-b:v", "4M", "-cq", "30"] };
-      if (encoders.av1_amf)   return { name: "av1_amf",   args: ["-c:v", "av1_amf",   "-quality", "speed", "-b:v", "4M"] };
+      if (encoders.av1_nvenc) return { name: "av1_nvenc", hwaccel: "cuda",    args: ["-c:v", "av1_nvenc", "-preset", "p4", "-b:v", "4M", "-cq", "30"] };
+      if (encoders.av1_amf)   return { name: "av1_amf",   hwaccel: "d3d11va", args: ["-c:v", "av1_amf",   "-quality", "speed", "-b:v", "4M"] };
     }
     if (codec === "hevc") {
-      if (encoders.hevc_nvenc) return { name: "hevc_nvenc", args: ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"] };
-      if (encoders.hevc_amf)   return { name: "hevc_amf",   args: ["-c:v", "hevc_amf",   "-quality", "speed", "-b:v", "4M"] };
+      if (encoders.hevc_nvenc) return { name: "hevc_nvenc", hwaccel: "cuda",    args: ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"] };
+      if (encoders.hevc_amf)   return { name: "hevc_amf",   hwaccel: "d3d11va", args: ["-c:v", "hevc_amf",   "-quality", "speed", "-b:v", "4M"] };
     }
-    if (encoders.h264_nvenc) return { name: "h264_nvenc", args: ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20", "-b:v", "0", "-profile:v", "high"] };
-    if (encoders.h264_amf)   return { name: "h264_amf",   args: ["-c:v", "h264_amf",   "-quality", "speed", "-b:v", "5M"] };
+    if (encoders.h264_nvenc) return { name: "h264_nvenc", hwaccel: "cuda",    args: ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20", "-b:v", "0", "-profile:v", "high"] };
+    if (encoders.h264_amf)   return { name: "h264_amf",   hwaccel: "d3d11va", args: ["-c:v", "h264_amf",   "-quality", "speed", "-b:v", "5M"] };
   }
-  if (codec === "av1") return { name: "libsvtav1", args: ["-c:v", "libsvtav1", "-preset", "8", "-crf", "30"] };
-  if (codec === "hevc") return { name: "libx265", args: ["-c:v", "libx265", "-preset", "medium", "-crf", "23"] };
-  return { name: "libx264", args: ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"] };
+  if (codec === "av1") return { name: "libsvtav1", hwaccel: null, args: ["-c:v", "libsvtav1", "-preset", "8", "-crf", "30"] };
+  if (codec === "hevc") return { name: "libx265",  hwaccel: null, args: ["-c:v", "libx265",  "-preset", "medium", "-crf", "23"] };
+  return { name: "libx264", hwaccel: null, args: ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"] };
 }
 
 // ----------------------------------------------------------------------------
@@ -149,6 +153,10 @@ function pickEncoder({ gpu, codec = "h264", encoders = {} }) {
 // libass burn-in happens *after* the canvas is built so the typography
 // renders at the publication aspect — not at the source aspect.
 
+// Filter chain for one aspect. libass is a CPU filter, so we keep frames in
+// system memory throughout the chain. With hwaccel enabled, ffmpeg downloads
+// decoded frames to CPU automatically (we omit `-hwaccel_output_format` for
+// exactly this reason) — so the chain stays identical to the CPU path.
 function aspectFilter({ aspectKey, cropMode, assPath }) {
   const aspect = ASPECTS[aspectKey];
   const { width: W, height: H } = aspect;
@@ -193,6 +201,7 @@ export async function renderClipMultiAspect({
   codec = "h264",
   rough = false,
   subtitlesDir,
+  onProgress = null,
 }) {
   await mkdir(outputDir, { recursive: true });
 
@@ -262,17 +271,18 @@ export async function renderClipMultiAspect({
     assByAspect[key] = file.path;
   }
 
+  // 4) Encoder selection — also tells us which hwaccel makes sense.
+  const encoder = pickEncoder({ gpu, codec, encoders: availableEncoders });
+
   // 3) Build the filter graph. One [0:v] source -> split into N taps ->
-  //    each tap runs its own aspect filter chain.
+  //    each tap runs its own aspect filter chain (with hwdownload prepended
+  //    when we're decoding on the GPU).
   const splitTargets = aspectKeys.map((k) => `[v_${k}]`).join("");
   const filterParts = [
     `[0:v]split=${aspectKeys.length}${splitTargets}`,
     ...aspectKeys.map((k) => `[v_${k}]${aspectFilter({ aspectKey: k, cropMode, assPath: assByAspect[k] })}[out_${k}]`),
   ];
   const audioFilter = buildLoudnormFilter(measured);
-
-  // 4) Encoder selection.
-  const encoder = pickEncoder({ gpu, codec, encoders: availableEncoders });
 
   // 5) Per-aspect output mappings.
   const aspectOutputs = aspectKeys.map((k) => {
@@ -283,13 +293,33 @@ export async function renderClipMultiAspect({
   // We render each aspect as its own output mapping in a single ffmpeg call.
   // This is faster and simpler than the tee muxer when each output has its
   // own filter chain.
+  //
+  // `-progress pipe:1` makes ffmpeg emit machine-readable key=value progress
+  // lines on stdout every `-stats_period`. We parse them in runWithProgress
+  // and forward to onProgress.
+  // Hardware-decode prefix. CUDA pairs with NVENC; d3d11va pairs with AMF.
+  // We deliberately omit `-hwaccel_output_format` so frames auto-download
+  // to CPU after decode — libass is a CPU filter, and forcing GPU surfaces
+  // through the chain would need an explicit hwupload before every NVENC
+  // mapping. The decode itself is still GPU-accelerated, which is where
+  // most of the speedup lives.
+  const hwAccelArgs = [];
+  if (encoder.hwaccel === "cuda") {
+    hwAccelArgs.push("-hwaccel", "cuda");
+  } else if (encoder.hwaccel === "d3d11va") {
+    hwAccelArgs.push("-hwaccel", "d3d11va");
+  }
+
   const args = [
     "-y", "-hide_banner",
+    "-progress", "pipe:1",
+    "-stats_period", "0.5",
     // Both seek (-ss) and duration (-t) placed BEFORE -i become input
     // options. That bounds the read window for every output mapping;
     // otherwise `-t` only applies to the first output in the chain.
     "-ss", String(startTime),
     "-t", String(duration),
+    ...hwAccelArgs,
     "-i", sourcePath,
     "-filter_complex", filterParts.join(";"),
     "-af", audioFilter,
@@ -310,12 +340,14 @@ export async function renderClipMultiAspect({
   }
 
   const startedAt = new Date().toISOString();
-  let stderr = "";
+  let stderr;
   try {
-    ({ stderr } = await execFileAsync("ffmpeg", args, {
-      timeout: RENDER_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024 * 16,
-    }));
+    stderr = await runFfmpegWithProgress({
+      args,
+      duration,
+      onProgress,
+      timeoutMs: RENDER_TIMEOUT_MS,
+    });
   } catch (error) {
     // Surface the ffmpeg stderr tail rather than the generic exit-1 message.
     const tail = (error.stderr || "").split(/\r?\n/).slice(-30).join("\n");
@@ -343,6 +375,111 @@ export async function renderClipMultiAspect({
     loudnorm: measured,
     ass: writtenAssFiles,
   };
+}
+
+// ----------------------------------------------------------------------------
+// Spawn ffmpeg and stream its `-progress pipe:1` output as structured events.
+//
+// FFmpeg's progress format is one key=value per line, separated by a
+// "progress=continue\n" or "progress=end\n" terminator per status snapshot.
+// We accumulate keys into a snapshot, fire onProgress when we see the
+// terminator, and resolve with the captured stderr tail when ffmpeg exits.
+
+async function runFfmpegWithProgress({ args, duration, onProgress, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", args, { windowsHide: true });
+
+    let stderrBuf = "";
+    let stdoutBuf = "";
+    const snapshot = {};
+    let lastEmit = 0;
+    const totalUs = Math.max(1, duration * 1_000_000);
+
+    const flushSnapshot = () => {
+      if (!onProgress) return;
+      const now = Date.now();
+      // Throttle to ~5 Hz so we don't drown the SSE channel.
+      if (now - lastEmit < 200) return;
+      lastEmit = now;
+      const outUs = Number(snapshot.out_time_us ?? snapshot.out_time_ms ?? 0);
+      // out_time_ms in newer ffmpeg builds is actually microseconds (a
+      // long-standing naming quirk). Both keys carry µs, so the same math
+      // applies regardless of which key the build emits.
+      const percent = Math.max(0, Math.min(100, (outUs / totalUs) * 100));
+      onProgress({
+        kind: "progress",
+        percent: round2(percent),
+        outTimeMs: Math.round(outUs / 1000),
+        fps: snapshot.fps != null ? Number(snapshot.fps) : null,
+        speed: snapshot.speed ?? null,
+        frame: snapshot.frame != null ? Number(snapshot.frame) : null,
+        bitrate: snapshot.bitrate ?? null,
+      });
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBuf += chunk.toString("utf-8");
+      let nl;
+      while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+        const line = stdoutBuf.slice(0, nl).trim();
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (!line) continue;
+        const eq = line.indexOf("=");
+        if (eq < 0) continue;
+        const k = line.slice(0, eq).trim();
+        const v = line.slice(eq + 1).trim();
+        snapshot[k] = v;
+        if (k === "progress") {
+          flushSnapshot();
+        }
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      // Cap to last ~64KB so a chatty filter (libass) doesn't balloon memory.
+      stderrBuf = (stderrBuf + chunk.toString("utf-8")).slice(-65536);
+    });
+
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* noop */ }
+      const err = new Error(`ffmpeg timed out after ${timeoutMs}ms`);
+      err.stderr = stderrBuf;
+      reject(err);
+    }, timeoutMs);
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      err.stderr = stderrBuf;
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        // Emit one final 100% snapshot so the UI bar lands cleanly.
+        if (onProgress) {
+          onProgress({
+            kind: "progress",
+            percent: 100,
+            outTimeMs: Math.round(duration * 1000),
+            fps: snapshot.fps != null ? Number(snapshot.fps) : null,
+            speed: snapshot.speed ?? null,
+            frame: snapshot.frame != null ? Number(snapshot.frame) : null,
+            bitrate: snapshot.bitrate ?? null,
+          });
+        }
+        resolve(stderrBuf);
+      } else {
+        const err = new Error(`ffmpeg exited with code ${code}`);
+        err.stderr = stderrBuf;
+        reject(err);
+      }
+    });
+  });
+}
+
+function round2(v) {
+  return Math.round(v * 100) / 100;
 }
 
 // ----------------------------------------------------------------------------

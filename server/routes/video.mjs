@@ -25,6 +25,20 @@ import {
   generateThumbnails,
   generateWaveform,
 } from "../services/video/thumbnails.mjs";
+import {
+  ytdlpStatus,
+  probeYouTube,
+  downloadYouTube,
+} from "../services/video/youtube.mjs";
+import {
+  createJob,
+  emitJobEvent,
+  attachSseStream,
+  getJob,
+} from "../services/video/jobs.mjs";
+import { telegramSendVideo } from "../services/telegram.mjs";
+import { publicSafetyCheck } from "../services/safetyFilter.mjs";
+import { searchVideoSources } from "../services/video/sources.mjs";
 
 const router = express.Router();
 
@@ -40,10 +54,12 @@ const transcriptsDir = path.join(rootDir, "artifacts", "transcripts");
 router.get("/video/status", async (_req, res) => {
   const ffmpeg = await ffmpegHealth();
   const whisper = await whisperStatus();
+  const youtube = await ytdlpStatus();
   res.json({
     ok: true,
     ffmpeg,
     whisper,
+    youtube,
     aspects: Object.entries(ASPECTS).map(([key, value]) => ({ key, ...value })),
     outputDir: clipsDir,
     publicBaseUrl: "/artifacts/clips",
@@ -54,6 +70,154 @@ router.get("/video/status", async (_req, res) => {
 router.get("/video/whisper/status", async (_req, res) => {
   const status = await whisperStatus();
   res.json({ ok: true, whisper: status });
+});
+
+// GET /api/video/youtube/status — yt-dlp install + version
+router.get("/video/youtube/status", async (_req, res) => {
+  const status = await ytdlpStatus();
+  res.json({ ok: true, youtube: status });
+});
+
+// POST /api/video/youtube/probe — metadata only, no download
+router.post("/video/youtube/probe", async (req, res) => {
+  const url = String(req.body?.url ?? "").trim();
+  if (!url) {
+    jsonError(res, 400, "url is required.");
+    return;
+  }
+  try {
+    const info = await probeYouTube(url);
+    res.json({ ok: true, info });
+  } catch (error) {
+    const status = error.code === "YTDLP_MISSING" ? 501 : 400;
+    jsonError(res, status, "YouTube probe failed.", error.message);
+  }
+});
+
+// GET /api/video/jobs/:id/events — SSE progress for any background job
+router.get("/video/jobs/:id/events", (req, res) => {
+  attachSseStream(res, req.params.id);
+});
+
+// GET /api/video/jobs/:id — snapshot lookup (used as SSE fallback)
+router.get("/video/jobs/:id", (req, res) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    jsonError(res, 404, "Unknown job id.");
+    return;
+  }
+  res.json({
+    ok: true,
+    job: {
+      id: job.id,
+      kind: job.kind,
+      status: job.status,
+      progress: job.progress,
+      result: job.result,
+      error: job.error,
+      meta: job.meta,
+    },
+  });
+});
+
+// POST /api/video/youtube/download/start — async variant. Returns {jobId}
+// immediately and runs yt-dlp in the background. Subscribe to
+// GET /api/video/jobs/:id/events to follow progress.
+router.post("/video/youtube/download/start", async (req, res) => {
+  const url = String(req.body?.url ?? "").trim();
+  if (!url) {
+    jsonError(res, 400, "url is required.");
+    return;
+  }
+  const maxHeight = Math.max(360, Math.min(2160, Number(req.body?.maxHeight) || 1080));
+  const sectionRange = req.body?.sectionRange ? String(req.body.sectionRange) : null;
+  const cookiesFromBrowser = req.body?.cookiesFromBrowser ? String(req.body.cookiesFromBrowser) : null;
+
+  const job = createJob({ kind: "download", meta: { url, maxHeight, sectionRange } });
+  res.json({ ok: true, jobId: job.id });
+
+  // Fire-and-forget — never throws out of this handler.
+  (async () => {
+    emitJobEvent(job.id, { kind: "status", message: "Starting yt-dlp…" });
+    try {
+      const result = await downloadYouTube({
+        url,
+        maxHeight,
+        sectionRange,
+        cookiesFromBrowser,
+        onProgress: (event) => emitJobEvent(job.id, event),
+      });
+      emitJobEvent(job.id, {
+        kind: "done",
+        payload: {
+          id: result.id,
+          sourceRelPath: result.sourceRelPath,
+          publicUrl: result.publicUrl,
+          cached: result.cached,
+          info: result.info,
+        },
+      });
+    } catch (error) {
+      emitJobEvent(job.id, {
+        kind: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+});
+
+// POST /api/video/youtube/download — pulls the video and returns a source path
+// the rest of the pipeline (timeline / scan / render) can consume.
+router.post("/video/youtube/download", async (req, res) => {
+  const url = String(req.body?.url ?? "").trim();
+  if (!url) {
+    jsonError(res, 400, "url is required.");
+    return;
+  }
+  const maxHeight = Math.max(360, Math.min(2160, Number(req.body?.maxHeight) || 1080));
+  const sectionRange = req.body?.sectionRange ? String(req.body.sectionRange) : null;
+  const cookiesFromBrowser = req.body?.cookiesFromBrowser ? String(req.body.cookiesFromBrowser) : null;
+
+  try {
+    const result = await downloadYouTube({
+      url,
+      maxHeight,
+      sectionRange,
+      cookiesFromBrowser,
+    });
+    res.json({
+      ok: true,
+      download: {
+        id: result.id,
+        sourceRelPath: result.sourceRelPath,
+        publicUrl: result.publicUrl,
+        cached: result.cached,
+        info: result.info,
+      },
+    });
+  } catch (error) {
+    const status = error.code === "YTDLP_MISSING" ? 501 : 500;
+    jsonError(res, status, "YouTube download failed.", error.message);
+  }
+});
+
+// GET /api/video/sources/search
+// Discovers official/rights-aware video candidates. First provider: ScoreBat.
+router.get("/video/sources/search", async (req, res) => {
+  try {
+    const result = await searchVideoSources({
+      query: req.query.query,
+      team: req.query.team,
+      competition: req.query.competition,
+      date: req.query.date,
+      providers: req.query.providers ? String(req.query.providers).split(",") : ["scorebat", "highlightly", "youtube"],
+      creativeCommonsOnly: req.query.creativeCommonsOnly === "true",
+      limit: req.query.limit,
+    });
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    jsonError(res, error.status ?? 502, "Video source search failed.", error.details ?? error.message);
+  }
 });
 
 // ----------------------------------------------------------------------------
@@ -347,6 +511,157 @@ router.post("/clips/merge", async (req, res) => {
   }
 });
 
+// Parse a render request body into a normalised inputs object, or return a
+// {error, status} pair the caller can hand to jsonError. Used by both the
+// sync and async render endpoints so the validation never drifts.
+function parseRenderRequest(body) {
+  const sourcePath = resolveMediaPath(body?.sourcePath);
+  const title = String(body?.title ?? "match-signal-clip");
+  const matchId = slug(body?.matchId ?? "match");
+  const clipType = slug(body?.clipType ?? "clip");
+  const rough = body?.mode === "rough";
+  const cropMode = body?.cropMode === "fit" ? "fit" : "fill";
+  const startTime = asSeconds(body?.startTime, 0);
+  const requestedEnd = body?.endTime === undefined ? null : asSeconds(body.endTime, startTime + 20);
+  const requestedDuration = body?.duration === undefined ? null : asSeconds(body.duration, 20);
+  const duration = Math.max(0.5, requestedEnd !== null ? requestedEnd - startTime : requestedDuration ?? 20);
+
+  const requestedAspectsRaw = Array.isArray(body?.aspects) && body.aspects.length
+    ? body.aspects
+    : ["9x16"];
+  const aspects = requestedAspectsRaw.map(String).filter((k) => ASPECTS[k]);
+
+  if (!sourcePath) return { error: "sourcePath is required.", status: 400 };
+  if (!aspects.length) {
+    return {
+      error: `Unknown aspect ratios. Allowed: ${Object.keys(ASPECTS).join(", ")}`,
+      status: 400,
+    };
+  }
+  if (duration <= 0) return { error: "Clip duration must be greater than zero.", status: 400 };
+
+  const subtitle = {
+    watermarkText: String(body?.watermarkText ?? ""),
+    headlineText: String(body?.headlineText ?? ""),
+    captionText: String(body?.captionText ?? ""),
+    accentText: String(body?.accentText ?? ""),
+    transcriptCues: Array.isArray(body?.transcriptCues) ? body.transcriptCues : [],
+  };
+
+  const gpu = !!body?.gpuAcceleration;
+  const codec = ["h264", "hevc", "av1"].includes(body?.codec) ? body.codec : "h264";
+
+  return {
+    inputs: {
+      sourcePath, title, matchId, clipType, rough, cropMode,
+      startTime, duration, aspects, subtitle, gpu, codec,
+    },
+  };
+}
+
+// Run the actual render (with GPU→CPU fallback) and assemble the per-aspect
+// RenderJob payloads. Optional onProgress is forwarded to the FFmpeg call.
+async function runRender(inputs, { onProgress } = {}) {
+  const { sourcePath, title, matchId, clipType, rough, cropMode, startTime,
+    duration, aspects, subtitle, gpu, codec } = inputs;
+
+  await access(sourcePath);
+
+  const healthInfo = await ffmpegHealth();
+  const availableEncoders = healthInfo.configured ? healthInfo.encoders : {};
+
+  const outputDir = path.join(clipsDir, matchId, clipType);
+  const basename = `${new Date().toISOString().replace(/[:.]/g, "-")}-${slug(title)}`;
+
+  let result;
+  let usedGpu = gpu;
+  try {
+    result = await renderClipMultiAspect({
+      sourcePath, outputDir, basename, startTime, duration, aspects,
+      cropMode, subtitle, gpu, availableEncoders, codec, rough,
+      subtitlesDir, onProgress,
+    });
+  } catch (error) {
+    if (!gpu || rough) throw error;
+    usedGpu = false;
+    result = await renderClipMultiAspect({
+      sourcePath, outputDir, basename, startTime, duration, aspects,
+      cropMode, subtitle, gpu: false, availableEncoders, codec, rough,
+      subtitlesDir, onProgress,
+    });
+  }
+
+  const jobs = result.aspects.map((a) => {
+    const relFromArtifacts = path.relative(artifactsDir, a.outputPath).split(path.sep).join("/");
+    return {
+      id: `${basename}-${a.aspect}`,
+      title, matchId, clipType,
+      aspect: a.aspect,
+      mode: rough ? "rough" : "final",
+      cropMode, startTime, duration,
+      width: a.width ?? null,
+      height: a.height ?? null,
+      platforms: a.platforms ?? [],
+      encoder: a.encoder,
+      sourcePath,
+      outputPath: a.outputPath,
+      publicUrl: `/artifacts/${relFromArtifacts}`,
+      startedAt: a.startedAt,
+      completedAt: a.completedAt,
+      gpuAcceleration: usedGpu,
+      gpuFallback: gpu && !usedGpu,
+    };
+  });
+
+  await cleanupAssFiles(result.ass);
+
+  return {
+    jobs,
+    loudnorm: result.loudnorm,
+    command: result.command,
+    logTail: result.logTail,
+  };
+}
+
+// POST /api/clips/render/start — async variant. Returns {jobId} immediately
+// and renders in the background, emitting progress events the UI can
+// subscribe to via GET /api/video/jobs/:id/events. Identical body shape to
+// the sync /api/clips/render route.
+router.post("/clips/render/start", async (req, res) => {
+  const parsed = parseRenderRequest(req.body);
+  if (parsed.error) {
+    jsonError(res, parsed.status, parsed.error);
+    return;
+  }
+
+  const job = createJob({
+    kind: "render",
+    meta: {
+      title: parsed.inputs.title,
+      matchId: parsed.inputs.matchId,
+      clipType: parsed.inputs.clipType,
+      aspects: parsed.inputs.aspects,
+      duration: parsed.inputs.duration,
+    },
+  });
+  res.json({ ok: true, jobId: job.id });
+
+  (async () => {
+    emitJobEvent(job.id, { kind: "status", message: "Measuring loudness…" });
+    try {
+      const result = await runRender(parsed.inputs, {
+        onProgress: (event) => emitJobEvent(job.id, event),
+      });
+      emitJobEvent(job.id, { kind: "done", payload: result });
+    } catch (error) {
+      emitJobEvent(job.id, {
+        kind: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+});
+
 // POST /api/clips/render
 // Body:
 //   sourcePath, title, matchId, clipType
@@ -361,138 +676,168 @@ router.post("/clips/merge", async (req, res) => {
 //
 // Returns: { ok, jobs: [RenderJob, ...] } — one per requested aspect.
 router.post("/clips/render", async (req, res) => {
-  const sourcePath = resolveMediaPath(req.body?.sourcePath);
-  const title = String(req.body?.title ?? "match-signal-clip");
-  const matchId = slug(req.body?.matchId ?? "match");
-  const clipType = slug(req.body?.clipType ?? "clip");
-  const rough = req.body?.mode === "rough";
-  const cropMode = req.body?.cropMode === "fit" ? "fit" : "fill";
-  const startTime = asSeconds(req.body?.startTime, 0);
-  const requestedEnd = req.body?.endTime === undefined ? null : asSeconds(req.body.endTime, startTime + 20);
-  const requestedDuration = req.body?.duration === undefined ? null : asSeconds(req.body.duration, 20);
-  const duration = Math.max(0.5, requestedEnd !== null ? requestedEnd - startTime : requestedDuration ?? 20);
-
-  const requestedAspectsRaw = Array.isArray(req.body?.aspects) && req.body.aspects.length
-    ? req.body.aspects
-    : ["9x16"];
-  const aspects = requestedAspectsRaw
-    .map(String)
-    .filter((k) => ASPECTS[k]);
-
-  if (!aspects.length) {
-    jsonError(res, 400, `Unknown aspect ratios. Allowed: ${Object.keys(ASPECTS).join(", ")}`);
+  const parsed = parseRenderRequest(req.body);
+  if (parsed.error) {
+    jsonError(res, parsed.status, parsed.error);
     return;
   }
-
-  if (!sourcePath) {
-    jsonError(res, 400, "sourcePath is required.");
-    return;
-  }
-  if (duration <= 0) {
-    jsonError(res, 400, "Clip duration must be greater than zero.");
-    return;
-  }
-
-  const subtitle = {
-    watermarkText: String(req.body?.watermarkText ?? ""),
-    headlineText: String(req.body?.headlineText ?? ""),
-    captionText: String(req.body?.captionText ?? ""),
-    accentText: String(req.body?.accentText ?? ""),
-    transcriptCues: Array.isArray(req.body?.transcriptCues) ? req.body.transcriptCues : [],
-  };
-
-  const gpu = !!req.body?.gpuAcceleration;
-  const codec = ["h264", "hevc", "av1"].includes(req.body?.codec) ? req.body.codec : "h264";
-
   try {
-    await access(sourcePath);
-
-    const healthInfo = await ffmpegHealth();
-    const availableEncoders = healthInfo.configured ? healthInfo.encoders : {};
-
-    // Group outputs under artifacts/clips/<matchId>/<clipType>/
-    const outputDir = path.join(clipsDir, matchId, clipType);
-    const basename = `${new Date().toISOString().replace(/[:.]/g, "-")}-${slug(title)}`;
-
-    let result;
-    let usedGpu = gpu;
-    try {
-      result = await renderClipMultiAspect({
-        sourcePath,
-        outputDir,
-        basename,
-        startTime,
-        duration,
-        aspects,
-        cropMode,
-        subtitle,
-        gpu,
-        availableEncoders,
-        codec,
-        rough,
-        subtitlesDir,
-      });
-    } catch (error) {
-      // GPU fallback: retry on CPU if the first pass was GPU and we're not rough-cutting.
-      if (!gpu || rough) throw error;
-      usedGpu = false;
-      result = await renderClipMultiAspect({
-        sourcePath,
-        outputDir,
-        basename,
-        startTime,
-        duration,
-        aspects,
-        cropMode,
-        subtitle,
-        gpu: false,
-        availableEncoders,
-        codec,
-        rough,
-        subtitlesDir,
-      });
-    }
-
-    // Build per-aspect RenderJob payloads for the UI.
-    const jobs = result.aspects.map((a) => {
-      const relFromArtifacts = path.relative(artifactsDir, a.outputPath).split(path.sep).join("/");
-      return {
-        id: `${basename}-${a.aspect}`,
-        title,
-        matchId,
-        clipType,
-        aspect: a.aspect,
-        mode: rough ? "rough" : "final",
-        cropMode,
-        startTime,
-        duration,
-        width: a.width ?? null,
-        height: a.height ?? null,
-        platforms: a.platforms ?? [],
-        encoder: a.encoder,
-        sourcePath,
-        outputPath: a.outputPath,
-        publicUrl: `/artifacts/${relFromArtifacts}`,
-        startedAt: a.startedAt,
-        completedAt: a.completedAt,
-        gpuAcceleration: usedGpu,
-        gpuFallback: gpu && !usedGpu,
-      };
-    });
-
-    // Cleanup .ass scratch files.
-    await cleanupAssFiles(result.ass);
-
-    res.json({
-      ok: true,
-      jobs,
-      loudnorm: result.loudnorm,
-      command: result.command,
-      logTail: result.logTail,
-    });
+    const result = await runRender(parsed.inputs);
+    res.json({ ok: true, ...result });
   } catch (error) {
     jsonError(res, 500, "Clip render failed.", error.stderr || error.message);
   }
+});
+
+// Map a destination key to a Telegram chatId + env-gate check. Returns a
+// {chatId, error?} pair. Future destinations (Buffer, Ayrshare) plug in by
+// adding cases here and a new sender function below.
+function resolveTelegramDestination(key) {
+  switch (key) {
+    case "telegram-admin":
+      return process.env.TELEGRAM_ADMIN_CHAT_ID
+        ? { chatId: process.env.TELEGRAM_ADMIN_CHAT_ID }
+        : { error: "TELEGRAM_ADMIN_CHAT_ID is not configured." };
+    case "telegram-public":
+      return process.env.TELEGRAM_PUBLIC_CHANNEL_ID
+        ? { chatId: process.env.TELEGRAM_PUBLIC_CHANNEL_ID }
+        : { error: "TELEGRAM_PUBLIC_CHANNEL_ID is not configured." };
+    case "telegram-vip":
+      if (!process.env.TELEGRAM_BETTING_CHANNEL_ID) {
+        return { error: "TELEGRAM_BETTING_CHANNEL_ID is not configured." };
+      }
+      if (process.env.VIP_PUBLISH_ENABLED === "false" || !String(process.env.VIP_JURISDICTIONS ?? "").trim()) {
+        return { error: "VIP publishing is not enabled. Set VIP_JURISDICTIONS in .env." };
+      }
+      return { chatId: process.env.TELEGRAM_BETTING_CHANNEL_ID };
+    default:
+      return { error: `Unknown destination: ${key}` };
+  }
+}
+
+function resolveLocalClipPath(input) {
+  if (!input) return null;
+  // Accept either a relative artifacts URL (/artifacts/clips/...) or a real
+  // path resolvable by resolveMediaPath.
+  if (typeof input === "string" && input.startsWith("/artifacts/")) {
+    const rel = input.replace(/^\//, ""); // -> artifacts/clips/...
+    return resolveMediaPath(rel);
+  }
+  return resolveMediaPath(input);
+}
+
+// POST /api/clips/ship
+// Body: {
+//   items: [{ publicUrl | sourcePath, caption?, width?, height?, duration? }],
+//   destinations: ["telegram-admin", "telegram-public", "telegram-vip", ...],
+//   parseMode?: "Markdown" | "MarkdownV2" | "HTML",
+//   defaultCaption?: string,
+// }
+//
+// Iterates every (clip × destination) pair and reports per-pair status.
+// Never throws — a failure for one pair is reported in the row but does not
+// abort the rest. Public-safety filter is applied to each caption before
+// any upload happens.
+router.post("/clips/ship", async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  const destinations = Array.isArray(req.body?.destinations) ? req.body.destinations : [];
+  const parseMode = req.body?.parseMode || null;
+  const defaultCaption = String(req.body?.defaultCaption ?? "");
+
+  if (!items.length) {
+    jsonError(res, 400, "items[] is required.");
+    return;
+  }
+  if (!destinations.length) {
+    jsonError(res, 400, "destinations[] is required.");
+    return;
+  }
+
+  const results = [];
+
+  for (const item of items) {
+    const clipPath = resolveLocalClipPath(item.publicUrl ?? item.sourcePath);
+    if (!clipPath) {
+      results.push({ clip: item.publicUrl ?? item.sourcePath ?? null, error: "Unresolvable clip path." });
+      continue;
+    }
+    try {
+      await access(clipPath);
+    } catch {
+      results.push({ clip: item.publicUrl ?? item.sourcePath, error: `Clip file not found at ${clipPath}.` });
+      continue;
+    }
+
+    const caption = String(item.caption ?? defaultCaption ?? "");
+    if (caption) {
+      const verdict = publicSafetyCheck(caption);
+      if (!verdict.ok) {
+        results.push({
+          clip: item.publicUrl ?? item.sourcePath,
+          error: "Public-safety filter rejected the caption.",
+          verdict,
+        });
+        continue;
+      }
+    }
+
+    for (const destinationKey of destinations) {
+      // For now, every supported destination is a Telegram chat. Other
+      // vendors plug in by branching here on the prefix.
+      if (!destinationKey.startsWith("telegram-")) {
+        results.push({
+          clip: item.publicUrl ?? item.sourcePath,
+          destination: destinationKey,
+          ok: false,
+          error: `Destination not implemented: ${destinationKey}. Add a handler in /api/clips/ship.`,
+        });
+        continue;
+      }
+
+      const resolved = resolveTelegramDestination(destinationKey);
+      if (resolved.error) {
+        results.push({
+          clip: item.publicUrl ?? item.sourcePath,
+          destination: destinationKey,
+          ok: false,
+          error: resolved.error,
+        });
+        continue;
+      }
+
+      try {
+        const tgResult = await telegramSendVideo({
+          chatId: resolved.chatId,
+          videoPath: clipPath,
+          caption,
+          parseMode,
+          duration: item.duration,
+          width: item.width,
+          height: item.height,
+        });
+        results.push({
+          clip: item.publicUrl ?? item.sourcePath,
+          destination: destinationKey,
+          ok: true,
+          messageId: tgResult.result?.message_id ?? null,
+        });
+      } catch (error) {
+        results.push({
+          clip: item.publicUrl ?? item.sourcePath,
+          destination: destinationKey,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  const summary = {
+    total: results.length,
+    ok: results.filter((r) => r.ok).length,
+    failed: results.filter((r) => r.ok === false || r.error).length,
+  };
+  res.json({ ok: true, summary, results });
 });
 
 export default router;

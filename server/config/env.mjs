@@ -31,8 +31,10 @@ export const required = {
   meta: "META_ACCESS_TOKEN",
   tiktok: "TIKTOK_CLIENT_KEY",
   youtube: "YOUTUBE_CLIENT_ID",
+  youtubeData: "YOUTUBE_API_KEY",
   xApi: "X_CLIENT_ID",
   bluesky: "BLUESKY_HANDLE",
+  scorebat: "SCOREBAT_API_KEY",
 };
 
 export const providerStatus = () =>

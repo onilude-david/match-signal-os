@@ -6,10 +6,14 @@ dist/
 *.local
 .claude/
 .claude/settings.local.json
-artifacts/clips/*.mp4
-artifacts/clips/smoke/
-artifacts/clips/verify/
+# Render and ingest outputs — generated, large, machine-specific.
+artifacts/clips/
 artifacts/subtitles/
 artifacts/thumbs/
 artifacts/waves/
+artifacts/sources/
+artifacts/transcripts/
+artifacts/scans/
 artifacts/test-workbook.xlsx
+# Downloaded Whisper models (~250MB)
+models/*.bin
