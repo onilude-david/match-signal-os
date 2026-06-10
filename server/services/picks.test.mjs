@@ -5,6 +5,7 @@ import {
   kellyStake,
   oneXTwoProbabilities,
   computePicks,
+  analyzeFixture,
   buildVipMessage,
   responsibleGamblingFooter,
 } from "./picks.mjs";
@@ -47,23 +48,25 @@ describe("expectedValue", () => {
   });
 });
 
-describe("kellyStake", () => {
+describe("kellyStake (units: 1u = 1% bankroll by default)", () => {
   it("returns 0 when there is no edge", () => {
-    // p below implied -> negative full Kelly -> 0
     expect(kellyStake(0.4, 2.0)).toBe(0);
   });
-  it("drops stakes below the floor to 0 (disciplined channel)", () => {
-    // quarter-Kelly of a small edge lands under the 0.25u default floor
-    expect(kellyStake(0.55, 2.0)).toBe(0);
+  it("drops a tiny edge below the 0.25u floor to 0", () => {
+    // p=0.502 @ 2.0: fullKelly 0.004 -> quarter 0.001 bankroll -> 0.1u < 0.25u
+    expect(kellyStake(0.502, 2.0)).toBe(0);
   });
-  it("returns a positive stake for a clear edge when the floor allows it", () => {
-    const stake = kellyStake(0.7, 2.0, { minUnits: 0.01 });
-    expect(stake).toBeGreaterThan(0);
-    expect(stake).toBeCloseTo(0.1, 6); // fullKelly 0.4 * 0.25 fraction
+  it("returns a sensible unit stake for a clear edge", () => {
+    // p=0.55 @ 2.0: fullKelly 0.1 -> quarter 0.025 of bankroll -> 2.5u
+    expect(kellyStake(0.55, 2.0)).toBeCloseTo(2.5, 6);
   });
-  it("respects the max-units cap", () => {
-    const stake = kellyStake(0.7, 2.0, { kellyFraction: 1, maxUnits: 0.1, minUnits: 0.01 });
-    expect(stake).toBe(0.1);
+  it("caps at the max-units ceiling for huge edges", () => {
+    // p=0.8 @ 2.0: quarter Kelly is 15% of bankroll -> 15u, capped to 3u
+    expect(kellyStake(0.8, 2.0)).toBe(3);
+  });
+  it("scales with the unit definition", () => {
+    // Same edge, but 1u = 2% of bankroll -> half the unit count.
+    expect(kellyStake(0.55, 2.0, { unitPct: 2 })).toBeCloseTo(1.25, 6);
   });
 });
 
@@ -95,12 +98,6 @@ describe("computePicks", () => {
     expect(computePicks({ id: "m1", teamA: "Strong", teamB: "Weak" }, ratings)).toEqual([]);
   });
   it("emits a value pick when the model strongly disagrees with the price", () => {
-    // NOTE: with the documented defaults (KELLY_FRACTION=0.25,
-    // MIN_STAKE_UNITS=0.25) quarter-Kelly of any realistic edge lands just
-    // under the 0.25u floor, so the channel publishes almost nothing. We set
-    // a lower floor here to exercise the emission path. This is a real tuning
-    // finding flagged in the audit, not a test workaround.
-    process.env.MIN_STAKE_UNITS = "0.01";
     const fixture = { id: "m1", teamA: "Strong", teamB: "Weak", homeOdds: 2.0, drawOdds: 4.0, awayOdds: 8.0, stage: "Group", date: "2026-06-11", time: "19:00" };
     const picks = computePicks(fixture, ratings);
     expect(picks.length).toBeGreaterThanOrEqual(1);
@@ -108,14 +105,62 @@ describe("computePicks", () => {
     expect(home).toBeTruthy();
     expect(home.ev).toBeGreaterThan(0);
     expect(home.stakeUnits).toBeGreaterThan(0);
+    expect(home.market).toBe("1X2");
   });
 
-  it("publishes nothing at default tuning even with a huge edge (floor >= quarter-Kelly ceiling)", () => {
-    // Documents the current behavior: default floor 0.25 with fraction 0.25
-    // means stakeUnits rounds to 0 for sub-certain edges, dropping the pick.
+  it("publishes at the recalibrated default floor (0.10u) for a clear edge", () => {
+    // Regression for the audit finding: the old 0.25u floor with quarter-Kelly
+    // swallowed every realistic edge. At the recalibrated 0.10u floor a strong
+    // mispriced favorite now produces at least one pick with default tuning.
     const fixture = { id: "m3", teamA: "Strong", teamB: "Weak", homeOdds: 2.0, drawOdds: 4.0, awayOdds: 8.0 };
     const picks = computePicks(fixture, ratings); // defaults restored by beforeEach
-    expect(picks).toEqual([]);
+    expect(picks.length).toBeGreaterThanOrEqual(1);
+    expect(picks[0].stakeUnits).toBeGreaterThanOrEqual(0.1);
+  });
+
+  it("computes a de-vigged fair probability and edge for each pick", () => {
+    const fixture = { id: "m4", teamA: "Strong", teamB: "Weak", homeOdds: 2.0, drawOdds: 4.0, awayOdds: 8.0 };
+    const picks = computePicks(fixture, ratings);
+    for (const p of picks) {
+      expect(typeof p.fairProb).toBe("number");
+      expect(p.edge).toBeGreaterThanOrEqual(0.02); // passed the discipline gate
+      expect(p.devigMethod).toBe("shin");
+    }
+  });
+
+  it("analyzeFixture returns model snapshot, picks, exposure, and message", () => {
+    const fixture = { id: "m5", teamA: "Strong", teamB: "Weak", homeOdds: 2.0, drawOdds: 4.0, awayOdds: 8.0, stage: "Group", date: "2026-06-11", time: "19:00" };
+    const out = analyzeFixture(fixture, ratings);
+    expect(out.model.lambdaHome).toBeGreaterThan(0);
+    expect(out.model.topScorelines.length).toBeGreaterThan(0);
+    expect(out.model.markets.oneXtwo.home).toBeGreaterThan(0);
+    expect(Array.isArray(out.picks)).toBe(true);
+    expect(out.totalStake).toBeGreaterThanOrEqual(0);
+    if (out.picks.length) {
+      expect(out.message).toContain("Strong vs Weak");
+      expect(out.message).toContain("Model xG");
+    }
+  });
+
+  it("prices Over/Under from line-shopped odds and uses the best book", () => {
+    const fixture = { id: "m6", teamA: "Strong", teamB: "Weak" };
+    const odds = {
+      best: {
+        h2h: { home: { price: 2.0, book: "Pinnacle" }, draw: { price: 4.0, book: "BetMGM" }, away: { price: 8.0, book: "Bet365" } },
+        totals: [{ line: 2.5, over: { price: 2.2, book: "FanDuel" }, under: { price: 1.75, book: "DraftKings" } }],
+      },
+    };
+    const picks = computePicks(fixture, ratings, { odds });
+    // A strong favorite vs a weak side skews toward Over; if it clears the
+    // gates it should carry the best over book.
+    const ou = picks.find((p) => p.market === "Over/Under");
+    if (ou) {
+      expect(ou.line).toBe(2.5);
+      expect(["FanDuel", "DraftKings"]).toContain(ou.bookName);
+    }
+    // 1X2 home pick should use the shopped book name, not a placeholder.
+    const home = picks.find((p) => p.market === "1X2" && p.side === "Home");
+    expect(home?.bookName).toBe("Pinnacle");
   });
   it("drops picks below the EV threshold", () => {
     // Price exactly fair-ish for the model -> EV under MIN_EV default 0.04

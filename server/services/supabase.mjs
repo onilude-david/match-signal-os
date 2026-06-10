@@ -26,33 +26,146 @@ export const normalizeAiContent = (content) => {
   };
 };
 
+const supabaseConfigured = () =>
+  Boolean(process.env.SUPABASE_URL && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY));
+
+const pickRow = (pick, fixtureId) => ({
+  pick_id: pick.id,
+  match_id: fixtureId,
+  market: pick.market,
+  side: pick.side,
+  label: pick.label,
+  line: pick.line ?? null,
+  model_prob: pick.modelProb,
+  fair_prob: pick.fairProb ?? null,
+  edge: pick.edge ?? null,
+  devig_method: pick.devigMethod ?? null,
+  book_name: pick.bookName,
+  book_price: pick.bookPrice,
+  implied_prob: pick.impliedProb,
+  ev: pick.ev,
+  stake_units: pick.stakeUnits,
+  confidence: pick.confidence,
+  created_at: pick.createdAt ?? new Date().toISOString(),
+});
+
 // Audit log for VIP picks. Best-effort: if the pick_log table is missing the
 // caller catches the error so a logging failure doesn't block a publish.
+// Falls back to a column-compatible subset if the god-mode columns aren't
+// migrated yet (so an older DB still records the core fields).
 export const logPicks = async ({ fixture, picks }) => {
-  if (!process.env.SUPABASE_URL || (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_PUBLISHABLE_KEY)) {
-    // Supabase not configured — no-op so audit failure never blocks publish.
+  if (!supabaseConfigured()) {
     return { logged: false, reason: "supabase not configured" };
   }
   const supabase = getSupabase();
-  const rows = picks.map((pick) => ({
-    pick_id: pick.id,
-    match_id: fixture.id,
-    market: pick.market,
-    side: pick.side,
-    label: pick.label,
-    model_prob: pick.modelProb,
-    book_name: pick.bookName,
-    book_price: pick.bookPrice,
-    implied_prob: pick.impliedProb,
-    ev: pick.ev,
-    stake_units: pick.stakeUnits,
-    confidence: pick.confidence,
-    created_at: pick.createdAt ?? new Date().toISOString(),
-  }));
-  const result = await supabase.from("pick_log").upsert(rows, { onConflict: "pick_id" });
+  const rows = picks.map((pick) => pickRow(pick, fixture.id));
+  let result = await supabase.from("pick_log").upsert(rows, { onConflict: "pick_id" });
+  if (result.error && /line|fair_prob|edge|devig_method/.test(String(result.error.message ?? ""))) {
+    const legacy = rows.map((r) => withoutKeys(r, ["line", "fair_prob", "edge", "devig_method"]));
+    result = await supabase.from("pick_log").upsert(legacy, { onConflict: "pick_id" });
+  }
   if (result.error) throw new Error(result.error.message);
   return { logged: true, count: rows.length };
 };
+
+// ---------------------------------------------------------------------------
+// CLV + settlement.
+
+// Closing line value: did we beat the market's final efficient price?
+// For a back bet at price P with closing price C, CLV% = P/C - 1 (positive
+// means we locked in a better-than-closing price — the #1 long-run signal).
+export const closingLineValue = (bookPrice, closingPrice) => {
+  const p = Number(bookPrice);
+  const c = Number(closingPrice);
+  if (!Number.isFinite(p) || !Number.isFinite(c) || p <= 1 || c <= 1) return null;
+  return p / c - 1;
+};
+
+// Record the closing price for a pick and compute its CLV. Used at kickoff.
+export const recordClosingLine = async (pickId, closingPrice) => {
+  if (!supabaseConfigured()) return { ok: false, reason: "supabase not configured" };
+  const supabase = getSupabase();
+  const existing = await supabase.from("pick_log").select("book_price").eq("pick_id", pickId).maybeSingle();
+  if (existing.error) throw new Error(existing.error.message);
+  if (!existing.data) return { ok: false, reason: "pick not found" };
+  const clv = closingLineValue(existing.data.book_price, closingPrice);
+  const result = await supabase
+    .from("pick_log")
+    .update({ closing_price: Number(closingPrice), clv, updated_at: new Date().toISOString() })
+    .eq("pick_id", pickId);
+  if (result.error) throw new Error(result.error.message);
+  return { ok: true, pickId, clv };
+};
+
+// Settle a pick: Win | Loss | Void. Optionally also record the closing price.
+export const settlePick = async (pickId, { result: outcome, closingPrice = null } = {}) => {
+  if (!supabaseConfigured()) return { ok: false, reason: "supabase not configured" };
+  const valid = new Set(["Win", "Loss", "Void"]);
+  if (!valid.has(outcome)) throw new Error(`Invalid result '${outcome}'. Use Win, Loss, or Void.`);
+  const supabase = getSupabase();
+  const patch = { result: outcome, settled_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  if (closingPrice != null) {
+    const existing = await supabase.from("pick_log").select("book_price").eq("pick_id", pickId).maybeSingle();
+    if (existing.error) throw new Error(existing.error.message);
+    if (existing.data) {
+      patch.closing_price = Number(closingPrice);
+      patch.clv = closingLineValue(existing.data.book_price, closingPrice);
+    }
+  }
+  const res = await supabase.from("pick_log").update(patch).eq("pick_id", pickId);
+  if (res.error) throw new Error(res.error.message);
+  return { ok: true, pickId, result: outcome };
+};
+
+// Pure: turn pick_log rows into a performance summary. Testable without a DB.
+// profit per settled pick (in units): Win -> stake*(price-1), Loss -> -stake,
+// Void -> 0. ROI = profit / staked. CLV beat rate = share of picks priced at
+// or above their closing line.
+export const summarizePicks = (rows = []) => {
+  const settled = rows.filter((r) => r.result === "Win" || r.result === "Loss" || r.result === "Void");
+  let staked = 0, profit = 0, wins = 0, losses = 0, voids = 0;
+  for (const r of settled) {
+    const stake = Number(r.stake_units) || 0;
+    const price = Number(r.book_price) || 0;
+    if (r.result === "Win") { profit += stake * (price - 1); wins += 1; staked += stake; }
+    else if (r.result === "Loss") { profit -= stake; losses += 1; staked += stake; }
+    else { voids += 1; } // void: stake returned, excluded from staked turnover
+  }
+  const withClv = rows.filter((r) => r.clv != null && Number.isFinite(Number(r.clv)));
+  const clvBeat = withClv.filter((r) => Number(r.clv) >= 0).length;
+  const avgClv = withClv.length ? withClv.reduce((s, r) => s + Number(r.clv), 0) / withClv.length : null;
+
+  return {
+    totalPicks: rows.length,
+    settled: settled.length,
+    pending: rows.length - settled.length,
+    wins,
+    losses,
+    voids,
+    hitRate: wins + losses > 0 ? wins / (wins + losses) : null,
+    stakedUnits: round2(staked),
+    profitUnits: round2(profit),
+    roi: staked > 0 ? profit / staked : null,
+    clvTracked: withClv.length,
+    clvBeatRate: withClv.length ? clvBeat / withClv.length : null,
+    avgClv,
+  };
+};
+
+// DB-backed analytics, optionally filtered by market or confidence.
+export const vipAnalytics = async ({ market = null, confidence = null, limit = 1000 } = {}) => {
+  if (!supabaseConfigured()) return { ok: false, reason: "supabase not configured" };
+  const supabase = getSupabase();
+  let query = supabase.from("pick_log").select("*").order("created_at", { ascending: false }).limit(limit);
+  if (market) query = query.eq("market", market);
+  if (confidence) query = query.eq("confidence", confidence);
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+  return { ok: true, summary: summarizePicks(data ?? []), sample: (data ?? []).slice(0, 25) };
+};
+
+const round2 = (v) => Math.round(v * 100) / 100;
+const round4 = (v) => Math.round(v * 10000) / 10000;
 
 export const fixtureFromRow = (row) => ({
   id: row.match_id,
