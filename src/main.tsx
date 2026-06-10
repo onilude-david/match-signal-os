@@ -55,6 +55,7 @@ import {
   ContentPack,
   SocialPlatform,
   ClipPlan,
+  ClipGodModeResult,
   RenderJob,
   AspectKey,
   Pick,
@@ -674,6 +675,7 @@ function App() {
   const [sourceProviderNote, setSourceProviderNote] = useState("");
   const [sourceCatalog, setSourceCatalog] = useState<VideoSourceSearchResponse["catalog"]>([]);
   const [clipPlans, setClipPlans] = useState<ClipPlan[]>([]);
+  const [clipGodMode, setClipGodMode] = useState<ClipGodModeResult | null>(null);
   const [selectedClipId, setSelectedClipId] = useState("");
   const [renderMode, setRenderMode] = useState<"rough" | "final">("final");
   const [cropMode, setCropMode] = useState<"fill" | "fit">("fill");
@@ -1414,6 +1416,46 @@ function App() {
     }
   };
 
+  const runClipGodMode = async () => {
+    if (!clipSourcePath.trim() && !scanResult) {
+      setApiMessage("Add a source video path or run a scan before Clip God Mode");
+      return;
+    }
+    setLoading((prev) => ({ ...prev, clipGodMode: true }));
+    try {
+      const result = await api<{ ok: boolean; godMode: ClipGodModeResult }>("/api/clips/god-mode", {
+        method: "POST",
+        body: JSON.stringify({
+          sourcePath: clipSourcePath,
+          scan: scanResult,
+          fixture: selectedFixture,
+          prediction,
+          content,
+          maxClips: 6,
+        }),
+      });
+      setClipGodMode(result.godMode);
+      setClipPlans(result.godMode.plans);
+      setSelectedClipId(result.godMode.plans[0]?.id ?? "");
+      if (result.godMode.recommendedAspects.length) {
+        setAspectSelection(result.godMode.recommendedAspects);
+      }
+      const top = result.godMode.plans[0];
+      if (top?.render) {
+        setRenderMode(top.render.mode);
+        setCropMode(top.render.cropMode);
+        setHeadlineText(top.render.headlineText);
+        setCaptionText(top.render.captionText);
+        setAccentText(top.render.accentText);
+      }
+      setApiMessage(`Clip God Mode: ${result.godMode.grade} · ${result.godMode.plans.length} ranked cut(s)`);
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "Clip God Mode failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, clipGodMode: false }));
+    }
+  };
+
   const transcribeClip = async (clip: ClipPlan) => {
     if (!clipSourcePath.trim()) {
       setApiMessage("Add a source video path before transcribing");
@@ -1457,6 +1499,18 @@ function App() {
       ),
     );
     setApiMessage(`Applied auto-suggestion (${suggestion.type}, score ${suggestion.score.toFixed(2)})`);
+  };
+
+  const selectClipPlan = (clip: ClipPlan) => {
+    setSelectedClipId(clip.id);
+    if (clip.render) {
+      setRenderMode(clip.render.mode);
+      setCropMode(clip.render.cropMode);
+      setAspectSelection(clip.render.aspects);
+      setHeadlineText(clip.render.headlineText);
+      setCaptionText(clip.render.captionText);
+      setAccentText(clip.render.accentText);
+    }
   };
 
   // Ship a single rendered RenderJob to every destination currently selected.
@@ -3113,6 +3167,9 @@ function App() {
               <div className="lg:self-end flex flex-wrap lg:justify-end gap-2">
                 <Button variant="secondary" icon={<Activity size={14} />} onClick={checkVideoEngine} loading={loading.checkVideoEngine}>Engine status</Button>
                 <Button variant="secondary" icon={<Sparkles size={14} />} onClick={createSampleVideo} loading={loading.createSample}>Create sample</Button>
+                <Button variant="primary" icon={<Wand2 size={14} />} onClick={runClipGodMode} loading={loading.clipGodMode}>
+                  Clip God Mode
+                </Button>
               </div>
             </header>
 
@@ -3401,6 +3458,32 @@ function App() {
                     </div>
                   )}
 
+                  {clipGodMode && (
+                    <section className="mt-7 border-y border-[var(--rule-strong)] py-5">
+                      <div className="flex flex-wrap items-baseline justify-between gap-3">
+                        <div>
+                          <p className="eyebrow gold">Clip God Mode</p>
+                          <h2 className="mt-1 text-ink">{clipGodMode.grade} grade director pass</h2>
+                        </div>
+                        <span className="figure text-[1.7rem] leading-none text-ink">{(clipGodMode.score * 100).toFixed(0)}/100</span>
+                      </div>
+                      <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-x-8 gap-y-4">
+                        <Metric label="Ranked cuts" value={String(clipGodMode.plans.length)} />
+                        <Metric label="Duration" value={`${Math.round(clipGodMode.duration)}s`} />
+                        <Metric label="Aspects" value={clipGodMode.recommendedAspects.join(" · ") || "—"} />
+                        <Metric label="Top cut" value={clipGodMode.plans[0]?.quality ?? "—"} />
+                      </div>
+                      <p className="mt-4 text-[0.9rem] leading-[1.55] text-[var(--ink-muted)]">{clipGodMode.summary}</p>
+                      {clipGodMode.risks.length > 0 && (
+                        <div className="mt-3 grid gap-1">
+                          {clipGodMode.risks.map((risk) => (
+                            <p key={risk} className="text-[0.82rem] text-[var(--ink-muted)]">{risk}</p>
+                          ))}
+                        </div>
+                      )}
+                    </section>
+                  )}
+
                   {scanResult && (
                     <div className="mt-7">
                       <div className="flex items-baseline justify-between pb-2 border-b border-[var(--rule)]">
@@ -3621,20 +3704,21 @@ function App() {
                       <article
                         className={`clip-plan-card ${selectedClip?.id === clip.id ? "active" : ""}`}
                         key={clip.id}
-                        onClick={() => setSelectedClipId(clip.id)}
+                        onClick={() => selectClipPlan(clip)}
                       >
                         <div className="clip-plan-heading">
                           <div>
                             <p className="eyebrow pitch">{clip.preset}</p>
                             <h3>{clip.title}</h3>
                           </div>
-                          <strong>{clip.duration}s</strong>
+                          <strong>{clip.quality ? `${clip.quality} · ` : ""}{clip.duration}s</strong>
                         </div>
                         <p className="clip-hook">{clip.hook}</p>
                         <p>{clip.treatment}</p>
                         <div className="clip-meta-row">
                           <span>{clip.startTime}s – {clip.endTime}s</span>
                           <span>{clip.platforms.join(" · ")}</span>
+                          {clip.score != null && <span>score {(clip.score * 100).toFixed(0)}</span>}
                         </div>
                         <Button
                           variant="primary"

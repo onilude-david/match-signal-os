@@ -40,6 +40,7 @@ import { telegramSendVideo } from "../services/telegram.mjs";
 import { publicSafetyCheck } from "../services/safetyFilter.mjs";
 import { geminiScanYouTube } from "../services/video/geminiScan.mjs";
 import { searchVideoSources } from "../services/video/sources.mjs";
+import { buildClipGodMode } from "../services/video/godMode.mjs";
 
 const router = express.Router();
 
@@ -496,6 +497,38 @@ router.post("/clips/plan", (req, res) => {
     ok: true,
     plans: buildClipPlans(req.body ?? {}),
   });
+});
+
+// POST /api/clips/god-mode
+// Director layer for the clipping workflow. It consumes an existing scan result
+// or runs /api/video/scan internally, then returns a ranked edit decision list
+// with recommended aspects, render mode, crop mode, and overlay text.
+router.post("/clips/god-mode", async (req, res) => {
+  const sourcePath = resolveMediaPath(req.body?.sourcePath);
+  const scan = req.body?.scan;
+  const maxClips = Math.max(1, Math.min(12, Number(req.body?.maxClips) || 6));
+
+  try {
+    let scanResult = scan;
+    if (!scanResult) {
+      if (!sourcePath) {
+        jsonError(res, 400, "sourcePath or scan is required.");
+        return;
+      }
+      await access(sourcePath);
+      scanResult = await scanSource({ sourcePath });
+    }
+    const godMode = buildClipGodMode({
+      scan: scanResult,
+      fixture: req.body?.fixture ?? {},
+      prediction: req.body?.prediction ?? {},
+      content: req.body?.content ?? {},
+      maxClips,
+    });
+    res.json({ ok: true, godMode });
+  } catch (error) {
+    jsonError(res, 500, "Clip God Mode failed.", error.stderr || error.message);
+  }
 });
 
 // POST /api/clips/merge — concat several rendered clips into one

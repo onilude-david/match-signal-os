@@ -263,6 +263,17 @@ export type ClipPlan = {
   treatment: string;
   reason: string;
   status: string;
+  score?: number;
+  quality?: "A" | "B" | "C" | "Hold";
+  render?: {
+    aspects: AspectKey[];
+    mode: "rough" | "final";
+    cropMode: "fill" | "fit";
+    codec: "h264" | "hevc" | "av1";
+    headlineText: string;
+    captionText: string;
+    accentText: string;
+  };
 };
 
 export type AspectKey = "9x16" | "1x1" | "16x9" | "4x5";
@@ -372,6 +383,18 @@ export type ScanResult = {
     candidatesTokenCount?: number;
     totalTokenCount?: number;
   };
+};
+
+export type ClipGodModeResult = {
+  ok: boolean;
+  grade: "A" | "B" | "C" | "Hold";
+  score: number;
+  summary: string;
+  source: string | null;
+  duration: number;
+  recommendedAspects: AspectKey[];
+  risks: string[];
+  plans: ClipPlan[];
 };
 
 // /api/video/transcribe -> TranscriptCue[]
