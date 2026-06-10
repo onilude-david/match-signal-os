@@ -1,5 +1,7 @@
 import dotenv from "dotenv";
+import { lookup } from "node:dns";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readSupabaseSnapshot, persistGeneratedContent, normalizeAiContent } from "./supabase.mjs";
@@ -18,6 +20,107 @@ const rootDir = path.resolve(__dirname, "../..");
 const dataDir = path.join(rootDir, "data");
 const statePath = path.join(dataDir, "app-state.json");
 
+const telegramLookup = (hostname, options, callback) => {
+  const connectIp = String(process.env.TELEGRAM_API_CONNECT_IP ?? "").trim();
+  if (connectIp && hostname === "api.telegram.org") {
+    if (options?.all) {
+      callback(null, [{ address: connectIp, family: 4 }]);
+      return;
+    }
+    callback(null, connectIp, 4);
+    return;
+  }
+  lookup(hostname, options, callback);
+};
+
+const telegramJsonRequest = (token, method, payload = {}) =>
+  new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const req = https.request({
+      hostname: "api.telegram.org",
+      path: `/bot${token}/${method}`,
+      method: "POST",
+      lookup: telegramLookup,
+      timeout: 30_000,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { raw += chunk; });
+      res.on("end", () => {
+        let parsed = {};
+        try {
+          parsed = raw ? JSON.parse(raw) : {};
+        } catch {
+          parsed = { description: raw };
+        }
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, body: parsed });
+      });
+    });
+    req.on("timeout", () => req.destroy(new Error("Telegram request timed out.")));
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+
+const telegramMultipartRequest = (token, method, fields, file) =>
+  new Promise((resolve, reject) => {
+    const boundary = `match-signal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const chunks = [];
+    const pushField = (name, value) => {
+      chunks.push(Buffer.from(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${name}"\r\n\r\n` +
+        `${value}\r\n`,
+      ));
+    };
+
+    for (const [name, value] of Object.entries(fields)) {
+      if (value !== undefined && value !== null) pushField(name, value);
+    }
+
+    chunks.push(Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="${file.fieldName}"; filename="${file.fileName}"\r\n` +
+      `Content-Type: ${file.contentType}\r\n\r\n`,
+    ));
+    chunks.push(file.bytes);
+    chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+    const contentLength = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    const req = https.request({
+      hostname: "api.telegram.org",
+      path: `/bot${token}/${method}`,
+      method: "POST",
+      lookup: telegramLookup,
+      timeout: 60_000,
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": contentLength,
+      },
+    }, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { raw += chunk; });
+      res.on("end", () => {
+        let parsed = {};
+        try {
+          parsed = raw ? JSON.parse(raw) : {};
+        } catch {
+          parsed = { description: raw };
+        }
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, body: parsed });
+      });
+    });
+    req.on("timeout", () => req.destroy(new Error("Telegram upload timed out.")));
+    req.on("error", reject);
+    for (const chunk of chunks) req.write(chunk);
+    req.end();
+  });
+
 export const readAppState = async () => {
   try {
     const raw = await readFile(statePath, "utf8");
@@ -34,19 +137,14 @@ export const writeAppState = async (state) => {
 
 export const telegramSendMessage = async ({ chatId, text, parseMode }) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      disable_web_page_preview: true,
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-    }),
+  const { ok, status, body } = await telegramJsonRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
   });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(body.description ?? `Telegram request failed with ${response.status}`);
+  if (!ok || body.ok === false) {
+    throw new Error(body.description ?? `Telegram request failed with ${status}`);
   }
   return body;
 };
@@ -57,9 +155,8 @@ export const telegramSendMessage = async ({ chatId, text, parseMode }) => {
 // clips comfortably (typical 9:16 30s render lands at 5-15MB).
 const TELEGRAM_VIDEO_LIMIT_BYTES = 50 * 1024 * 1024;
 
-// Send a local video file to a Telegram chat. Uses multipart/form-data
-// (Node 18+ has FormData + Blob in globals). Optional thumbnail/duration/
-// width/height get passed straight through when supplied.
+// Send a local video file to a Telegram chat. Uses the same HTTPS transport as
+// JSON Bot API calls so TELEGRAM_API_CONNECT_IP works for uploads too.
 export const telegramSendVideo = async ({
   chatId,
   videoPath,
@@ -86,37 +183,31 @@ export const telegramSendVideo = async ({
   const bytes = await readFile(videoPath);
   const fileName = videoPath.split(/[\\/]/).pop() ?? "clip.mp4";
 
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  if (caption) form.append("caption", caption);
-  if (parseMode) form.append("parse_mode", parseMode);
-  if (duration != null) form.append("duration", String(Math.round(duration)));
-  if (width != null) form.append("width", String(width));
-  if (height != null) form.append("height", String(height));
-  if (supportsStreaming) form.append("supports_streaming", "true");
-  form.append("video", new Blob([bytes], { type: "video/mp4" }), fileName);
-
-  const response = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
-    method: "POST",
-    body: form,
+  const { ok, status, body } = await telegramMultipartRequest(token, "sendVideo", {
+    chat_id: String(chatId),
+    caption: caption || undefined,
+    parse_mode: parseMode || undefined,
+    duration: duration != null ? String(Math.round(duration)) : undefined,
+    width: width != null ? String(width) : undefined,
+    height: height != null ? String(height) : undefined,
+    supports_streaming: supportsStreaming ? "true" : undefined,
+  }, {
+    fieldName: "video",
+    fileName,
+    contentType: "video/mp4",
+    bytes,
   });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok || body.ok === false) {
-    throw new Error(body.description ?? `Telegram sendVideo failed with ${response.status}`);
+  if (!ok || body.ok === false) {
+    throw new Error(body.description ?? `Telegram sendVideo failed with ${status}`);
   }
   return body;
 };
 
 export const telegramRequest = async (method, payload = {}) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok || body.ok === false) {
-    throw new Error(body.description ?? `Telegram ${method} failed with ${response.status}`);
+  const { ok, status, body } = await telegramJsonRequest(token, method, payload);
+  if (!ok || body.ok === false) {
+    throw new Error(body.description ?? `Telegram ${method} failed with ${status}`);
   }
   return body;
 };
