@@ -1370,6 +1370,42 @@ function App() {
     }
   };
 
+  // Smart scan via Gemini 2.5: sends the YouTube URL directly to Gemini and
+  // gets back football-semantic clip suggestions + a match summary. No
+  // download required — Gemini ingests YouTube natively. Falls back into
+  // the same ScanResult shape so the suggestions strip renders identically.
+  const geminiScan = async () => {
+    const url = youtubeUrl.trim();
+    if (!url) {
+      setApiMessage("Paste a YouTube URL first for smart scan");
+      return;
+    }
+    setLoading((prev) => ({ ...prev, geminiScan: true }));
+    try {
+      const fixtureContext = `${selectedFixture.teamA} vs ${selectedFixture.teamB} · ${selectedFixture.stage}${selectedFixture.venue ? ` · ${selectedFixture.venue}` : ""}`;
+      const result = await api<{ ok: boolean; scan: ScanResult & { summary?: string; model?: string } }>(
+        "/api/video/gemini-scan",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            youtubeUrl: url,
+            fixtureContext,
+            maxClips: 8,
+            model: "gemini-2.5-flash",
+          }),
+        },
+      );
+      setScanResult(result.scan);
+      const count = result.scan.suggestions?.length ?? 0;
+      const modelLabel = result.scan.model ?? "gemini-2.5-flash";
+      setApiMessage(`Smart scan (${modelLabel}): ${count} clip${count === 1 ? "" : "s"} identified`);
+    } catch (error) {
+      setApiMessage(error instanceof Error ? error.message : "Gemini scan failed");
+    } finally {
+      setLoading((prev) => ({ ...prev, geminiScan: false }));
+    }
+  };
+
   const transcribeClip = async (clip: ClipPlan) => {
     if (!clipSourcePath.trim()) {
       setApiMessage("Add a source video path before transcribing");
@@ -3160,7 +3196,7 @@ function App() {
 
                   {sourceMode === "youtube" ? (
                     <>
-                      <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-x-4 gap-y-3 items-end">
+                      <div className="mt-4 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-x-4 gap-y-3 items-end">
                         <label className="field">
                           <span>YouTube URL · paste to auto-probe</span>
                           <input
@@ -3170,6 +3206,16 @@ function App() {
                             className="font-mono"
                           />
                         </label>
+                        <Button
+                          variant="secondary"
+                          icon={<Sparkles size={14} />}
+                          onClick={geminiScan}
+                          loading={loading.geminiScan}
+                          disabled={!looksLikeYouTubeUrl(youtubeUrl) || loading.geminiScan}
+                          title="Smart scan via Gemini 2.5 — football-semantic moment detection without downloading the video"
+                        >
+                          Smart scan
+                        </Button>
                         <Button
                           variant="primary"
                           icon={<Download size={14} />}
@@ -3339,13 +3385,30 @@ function App() {
                   {scanResult && (
                     <div className="mt-7">
                       <div className="flex items-baseline justify-between pb-2 border-b border-[var(--rule)]">
-                        <p className="eyebrow gold">Auto-suggested moments</p>
+                        <p className="eyebrow gold">
+                          {scanResult.model ? `Smart scan · ${scanResult.model}` : "Auto-suggested moments"}
+                        </p>
                         <span className="caption">
-                          {scanResult.scenes.length} cut{scanResult.scenes.length === 1 ? "" : "s"} ·
-                          {" "}{scanResult.peaks.length} loud window{scanResult.peaks.length === 1 ? "" : "s"} ·
-                          {" "}{Math.round(scanResult.duration)}s
+                          {scanResult.model ? (
+                            <>
+                              {scanResult.suggestions.length} clip{scanResult.suggestions.length === 1 ? "" : "s"} ·
+                              {" "}{Math.round(scanResult.duration)}s
+                              {scanResult.usage?.totalTokenCount ? ` · ${(scanResult.usage.totalTokenCount / 1000).toFixed(1)}k tokens` : ""}
+                            </>
+                          ) : (
+                            <>
+                              {scanResult.scenes.length} cut{scanResult.scenes.length === 1 ? "" : "s"} ·
+                              {" "}{scanResult.peaks.length} loud window{scanResult.peaks.length === 1 ? "" : "s"} ·
+                              {" "}{Math.round(scanResult.duration)}s
+                            </>
+                          )}
                         </span>
                       </div>
+                      {scanResult.summary && (
+                        <p className="mt-3 text-[0.875rem] text-ink leading-[1.6] max-w-[70ch] font-display [font-variation-settings:'opsz'_60]">
+                          {scanResult.summary}
+                        </p>
+                      )}
                       {scanResult.crop.recommended && (
                         <p className="mt-2 text-[0.8rem] text-[var(--ink-muted)]">
                           Letterbox detected: cropdetect suggests {scanResult.crop.width}×{scanResult.crop.height} at offset {scanResult.crop.x},{scanResult.crop.y}.

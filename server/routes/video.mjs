@@ -38,6 +38,7 @@ import {
 } from "../services/video/jobs.mjs";
 import { telegramSendVideo } from "../services/telegram.mjs";
 import { publicSafetyCheck } from "../services/safetyFilter.mjs";
+import { geminiScanYouTube } from "../services/video/geminiScan.mjs";
 import { searchVideoSources } from "../services/video/sources.mjs";
 
 const router = express.Router();
@@ -377,6 +378,58 @@ router.post("/video/scan", async (req, res) => {
     res.json({ ok: true, scan: result });
   } catch (error) {
     jsonError(res, 500, "Scan failed.", error.stderr || error.message);
+  }
+});
+
+// ----------------------------------------------------------------------------
+// NEW: GEMINI SCAN — football-semantic moment detection via Gemini 2.5
+//
+// Body: { youtubeUrl, fixtureContext?, model?, maxClips? }
+// Returns: { ok, scan: { suggestions, summary, model, duration, usage } }
+//
+// This route is intentionally side-by-side with /api/video/scan (FFmpeg
+// scene + audio peak). The UI picks one based on what's available — the
+// Gemini path is the smart default when GEMINI_API_KEY is set and the
+// source is a YouTube URL (no download required, native YouTube ingest).
+
+router.post("/video/gemini-scan", async (req, res) => {
+  const youtubeUrl = String(req.body?.youtubeUrl ?? "").trim();
+  if (!youtubeUrl) {
+    jsonError(res, 400, "youtubeUrl is required.");
+    return;
+  }
+  const fixtureContext = String(req.body?.fixtureContext ?? "").trim();
+  const maxClips = Math.max(3, Math.min(12, Number(req.body?.maxClips) || 8));
+  const model = ["gemini-2.5-flash", "gemini-2.5-pro"].includes(req.body?.model)
+    ? req.body.model
+    : "gemini-2.5-flash";
+
+  try {
+    const result = await geminiScanYouTube({
+      youtubeUrl,
+      fixtureContext,
+      maxClips,
+      model,
+    });
+    res.json({
+      ok: true,
+      scan: {
+        source: youtubeUrl,
+        duration: result.duration,
+        suggestions: result.suggestions,
+        summary: result.summary,
+        model: result.model,
+        usage: result.usage,
+        // Shape parity with the FFmpeg scan so the UI can render either:
+        scenes: [],
+        peaks: [],
+        crop: { recommended: false, width: 0, height: 0, x: 0, y: 0 },
+        hasAudio: true,
+      },
+    });
+  } catch (error) {
+    const status = error.code === "GEMINI_NOT_CONFIGURED" ? 501 : 500;
+    jsonError(res, status, "Gemini scan failed.", error.message);
   }
 });
 

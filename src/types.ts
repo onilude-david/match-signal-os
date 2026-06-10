@@ -294,14 +294,22 @@ export type ScanCrop = {
 export type ScanResult = {
   source: string;
   duration: number;
-  width: number;
-  height: number;
-  fps: number;
-  hasAudio: boolean;
+  width?: number;
+  height?: number;
+  fps?: number;
+  hasAudio?: boolean;
   crop: ScanCrop;
   scenes: ScanScene[];
   peaks: ScanPeak[];
   suggestions: ClipSuggestion[];
+  // Present when the scan came from /api/video/gemini-scan:
+  summary?: string;
+  model?: string;
+  usage?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
 };
 
 // /api/video/transcribe -> TranscriptCue[]
