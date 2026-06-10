@@ -94,8 +94,19 @@ router.get("/polling/status", (_req, res) => {
 // POST /api/telegram/webhook
 // Always respond 2xx to Telegram. A non-2xx response causes Telegram to retry
 // the same update indefinitely, which can stampede the bot.
+//
+// This route is exempt from the API-key gate (Telegram can't send custom auth
+// headers), so it gets Telegram's own mechanism instead: register the webhook
+// with setWebhook's secret_token parameter and set the same value in
+// TELEGRAM_WEBHOOK_SECRET. Telegram then sends it back on every update as the
+// X-Telegram-Bot-Api-Secret-Token header, and forged requests get a 401.
 router.post("/webhook", async (req, res) => {
   if (!assertEnv(res, "TELEGRAM_BOT_TOKEN")) return;
+  const webhookSecret = (process.env.TELEGRAM_WEBHOOK_SECRET ?? "").trim();
+  if (webhookSecret && req.header("x-telegram-bot-api-secret-token") !== webhookSecret) {
+    res.status(401).json({ ok: false, error: "Invalid webhook secret token." });
+    return;
+  }
   try {
     await handleTelegramUpdate(req.body);
     res.json({ ok: true });

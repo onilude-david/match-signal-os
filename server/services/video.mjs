@@ -72,10 +72,29 @@ export const slug = (value) =>
     .replace(/^-+|-+$/g, "")
     .slice(0, 80) || "clip";
 
+// Media files only ever live under data/ (source videos) or artifacts/
+// (renders, downloads, transcripts). We intentionally do NOT allow the whole
+// project root: .env, server source, and package files sit there too.
+export const MEDIA_ROOTS = [
+  path.resolve(rootDir, "data"),
+  path.resolve(rootDir, "artifacts"),
+];
+
+// Resolve a caller-supplied media path to an absolute path, but ONLY if it
+// lands inside one of MEDIA_ROOTS. Without this containment check the routes
+// that feed user input here — /api/video/stream, /api/video/probe,
+// /api/clips/render — would read or stream arbitrary host files, including
+// this project's own .env (?path=.env) or any file via ?path=..\..\secret.
+// Anything outside the media roots resolves to "", which the callers already
+// treat as a 400/404.
 export const resolveMediaPath = (sourcePath) => {
   const raw = String(sourcePath ?? "").trim();
   if (!raw) return "";
-  return path.isAbsolute(raw) ? raw : path.resolve(rootDir, raw);
+  const resolved = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(rootDir, raw);
+  const allowed = MEDIA_ROOTS.some(
+    (root) => resolved === root || resolved.startsWith(root + path.sep),
+  );
+  return allowed ? resolved : "";
 };
 
 export const buildClipPlans = ({ fixture = {}, prediction = {}, content = {} }) => {

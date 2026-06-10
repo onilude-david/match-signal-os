@@ -2,6 +2,7 @@ import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { providerStatus } from "./config/env.mjs";
+import { requireApiKey, apiKeyConfigured } from "./config/auth.mjs";
 import { pollTelegramUpdates } from "./services/telegram.mjs";
 
 // Import routers
@@ -32,6 +33,11 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+// API-key gate. Must sit before every router. Open when MATCH_SIGNAL_API_KEY
+// is unset (local dev); enforced everywhere except /api/health and the
+// Telegram webhook when set. See config/auth.mjs.
+app.use(requireApiKey);
+
 // Mount routers
 app.use("/api", fixturesRouter);
 app.use("/api", contentRouter);
@@ -52,6 +58,12 @@ app.use((req, res, next) => {
 // Start server
 app.listen(port, "0.0.0.0", () => {
   console.log(`Match Signal API running on port ${port}`);
+  if (!apiKeyConfigured()) {
+    console.warn(
+      "[SECURITY] MATCH_SIGNAL_API_KEY is not set — the API is UNAUTHENTICATED. " +
+      "Fine on localhost; set a key in .env before exposing this server to a network.",
+    );
+  }
   if (process.env.TELEGRAM_POLLING_ENABLED !== "false" && process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_ADMIN_CHAT_ID) {
     pollTelegramUpdates();
   }

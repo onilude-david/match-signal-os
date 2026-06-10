@@ -21,6 +21,25 @@ npm start
 
 The Express server serves both the API and the built frontend from the same port.
 
+## API Authentication
+
+Every `/api` route (except `/api/health` and the Telegram webhook) is gated by a
+shared secret when `MATCH_SIGNAL_API_KEY` is set in `.env`. Unset = open, which
+is only acceptable on localhost; the server prints a security warning at boot.
+
+```bash
+# generate a key
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Put it in `.env` as `MATCH_SIGNAL_API_KEY=...`, then tell the frontend once in
+the browser console: `localStorage.setItem("msos.apiKey", "<the key>")`.
+External callers send it as `x-api-key: <key>`, `Authorization: Bearer <key>`,
+or `?apiKey=<key>` (the query form exists for EventSource and `<video>` tags,
+which cannot send headers). The Telegram webhook is instead protected with
+Telegram's native secret token: set `TELEGRAM_WEBHOOK_SECRET` and register the
+webhook with the matching `secret_token` parameter.
+
 ## API Setup
 
 Copy `.env.example` to `.env`, fill the keys, then restart `npm run dev`.

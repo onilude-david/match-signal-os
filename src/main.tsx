@@ -84,7 +84,7 @@ import { WorldCupDataView } from "./components/WorldCupDataView";
 import { Button } from "./components/ui/Button";
 
 // Import api client
-import { api } from "./utils/api";
+import { api, apiHeaders, withApiKey } from "./utils/api";
 
 const WORLD_CUP_2026_SPORTRADAR_SEASON_ID = "sr:season:101177";
 
@@ -2022,7 +2022,7 @@ function App() {
     try {
       const response = await fetch("/api/spreadsheet/workbook", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...apiHeaders() },
         body: JSON.stringify(snapshot()),
       });
       if (!response.ok) {
@@ -3329,7 +3329,7 @@ function App() {
                       <video
                         ref={sourceVideoRef}
                         controls
-                        src={`/api/video/stream?path=${encodeURIComponent(clipSourcePath)}`}
+                        src={withApiKey(`/api/video/stream?path=${encodeURIComponent(clipSourcePath)}`)}
                         className="w-full max-h-[300px] bg-[var(--ink)] border border-[var(--rule)] object-contain"
                         onLoadedMetadata={(e) => {
                           const v = e.currentTarget;

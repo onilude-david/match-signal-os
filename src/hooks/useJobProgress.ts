@@ -3,6 +3,7 @@
 // {status, percent, speedBytes, totalBytes, eta, result, error}.
 
 import { useEffect, useState } from "react";
+import { withApiKey } from "../utils/api";
 
 export type JobEvent =
   | { kind: "initial"; status: JobStatus; progress: ProgressPayload | null; result: any; error: string | null; meta?: Record<string, unknown> }
@@ -47,7 +48,8 @@ export function useJobProgress(jobId: string | null): JobProgressState {
     }
     setState({ ...initialState, status: "pending" });
 
-    const source = new EventSource(`/api/video/jobs/${jobId}/events`);
+    // EventSource cannot send headers — the key rides as a query param.
+    const source = new EventSource(withApiKey(`/api/video/jobs/${jobId}/events`));
 
     source.onmessage = (event) => {
       let parsed: JobEvent;

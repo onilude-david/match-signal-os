@@ -45,10 +45,13 @@ const FORBIDDEN_TERMS = [
   { kind: "market", re: /\bAsian\s+Handicap\b/i },
   // book names (only mention these in VIP)
   { kind: "book", re: /\b(?:Pinnacle|Bet365|DraftKings|FanDuel|Bet9ja|SportyBet|1xBet|Betway|William\s+Hill|Betfair)\b/i },
-  // decimal odds 1.50 - 9.99 (one or two decimals)
-  { kind: "odds", re: /(?<![\d.])(?:[1-9]\.\d{2,3})(?![\d.])/ },
-  // American odds (+150, -200) — but allow simple negative numbers via word context
-  { kind: "odds", re: /(?<![\w-])[+\-]\d{3,4}(?![\d.])/ },
+  // decimal odds 1.50 - 9.99 (two or three decimals). The trailing lookahead
+  // only rejects another digit, NOT a period — otherwise odds at the end of a
+  // sentence ("...priced at 1.85.") would slip through the filter.
+  { kind: "odds", re: /(?<![\d.])(?:[1-9]\.\d{2,3})(?!\d)/ },
+  // American odds (+150, -200). Same trailing-period fix as above so "+150."
+  // at a sentence end is still caught.
+  { kind: "odds", re: /(?<![\w-])[+\-]\d{3,4}(?!\d)/ },
 ];
 
 export const publicSafetyCheck = (text) => {
