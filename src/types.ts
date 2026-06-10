@@ -7,10 +7,14 @@ export type View = "command" | "data" | "lab" | "brand" | "content" | "video" | 
 export type Pick = {
   id: string;
   fixtureId: string;
-  market: "1X2";
-  side: "Home" | "Draw" | "Away";
+  market: "1X2" | "Over/Under" | "BTTS";
+  side: "Home" | "Draw" | "Away" | "Over" | "Under" | "Yes" | "No";
   label: string;
+  line?: number | null;
   modelProb: number;
+  fairProb?: number | null;
+  edge?: number | null;
+  devigMethod?: string | null;
   bookName: string;
   bookPrice: number;
   impliedProb: number;
@@ -20,10 +24,65 @@ export type Pick = {
   createdAt: string;
 };
 
+export type GodModeModel = {
+  lambdaHome: number;
+  lambdaAway: number;
+  expectedTotal: number;
+  markets: {
+    oneXtwo: { home: number; draw: number; away: number };
+    doubleChance: { homeOrDraw: number; homeOrAway: number; drawOrAway: number };
+    totals: Array<{ line: number; over: number; under: number }>;
+    btts: { yes: number; no: number };
+    drawNoBet: { home: number; away: number };
+  };
+  topScorelines: Array<{ score: string; home: number; away: number; prob: number }>;
+};
+
+export type GodModeDiagnosticCandidate = {
+  market: Pick["market"];
+  side: Pick["side"];
+  label: string;
+  line?: number | null;
+  modelProb: number;
+  fairProb?: number | null;
+  edge?: number | null;
+  bookName?: string;
+  bookPrice?: number | null;
+  impliedProb?: number | null;
+  ev?: number | null;
+  stakeUnits: number;
+  confidence: Pick["confidence"];
+  status: "qualified" | "watchlist";
+  reasons: string[];
+};
+
+export type GodModeDiagnostics = {
+  grade: "Attack" | "Measured" | "Small edge" | "No bet" | "Needs odds";
+  signalScore: number;
+  thresholds: {
+    minEv: number;
+    minEdge: number;
+    maxExposureUnits: number;
+    kellyFraction: number;
+    unitBankrollPct: number;
+  };
+  exposure: {
+    totalStake: number;
+    pickCount: number;
+    capped: boolean;
+  };
+  riskFlags: string[];
+  watchlist: GodModeDiagnosticCandidate[];
+  marketDiagnostics: GodModeDiagnosticCandidate[];
+};
+
 export type VipPreviewResponse = {
   ok: boolean;
   picks: Pick[];
   message: string | null;
+  model?: GodModeModel | null;
+  diagnostics?: GodModeDiagnostics | null;
+  totalStake?: number;
   vipPublishEnabled: boolean;
   jurisdictions: string[];
 };
@@ -33,6 +92,9 @@ export type VipPublishResponse = {
   published?: boolean;
   pickCount?: number;
   picks?: Pick[];
+  model?: GodModeModel | null;
+  diagnostics?: GodModeDiagnostics | null;
+  totalStake?: number;
   audit?: { logged: boolean; count?: number; error?: string };
   reason?: string;
 };

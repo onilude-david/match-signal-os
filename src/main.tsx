@@ -58,6 +58,8 @@ import {
   RenderJob,
   AspectKey,
   Pick,
+  GodModeDiagnostics,
+  GodModeModel,
   VipPreviewResponse,
   VipPublishResponse,
   ClipSuggestion,
@@ -867,6 +869,8 @@ function App() {
     if (!selectedFixture.homeOdds || !selectedFixture.awayOdds) {
       setVipPicks([]);
       setVipMessage("");
+      setGodModeModel(null);
+      setGodModeDiagnostics(null);
       return;
     }
     let cancelled = false;
@@ -879,12 +883,16 @@ function App() {
         if (cancelled) return;
         setVipPicks(result.picks ?? []);
         setVipMessage(result.message ?? "");
+        setGodModeModel(result.model ?? null);
+        setGodModeDiagnostics(result.diagnostics ?? null);
         setVipPublishEnabled(Boolean(result.vipPublishEnabled));
         setVipJurisdictions(result.jurisdictions ?? []);
       } catch {
         if (!cancelled) {
           setVipPicks([]);
           setVipMessage("");
+          setGodModeModel(null);
+          setGodModeDiagnostics(null);
         }
       }
     })();
@@ -1946,6 +1954,8 @@ function App() {
   // VIP_JURISDICTIONS + TELEGRAM_BETTING_CHANNEL_ID + VIP_PUBLISH_ENABLED.
   const [vipPicks, setVipPicks] = useState<Pick[]>([]);
   const [vipMessage, setVipMessage] = useState<string>("");
+  const [godModeModel, setGodModeModel] = useState<GodModeModel | null>(null);
+  const [godModeDiagnostics, setGodModeDiagnostics] = useState<GodModeDiagnostics | null>(null);
   const [vipPublishEnabled, setVipPublishEnabled] = useState<boolean>(false);
   const [vipJurisdictions, setVipJurisdictions] = useState<string[]>([]);
 
@@ -1958,9 +1968,11 @@ function App() {
       });
       setVipPicks(result.picks ?? []);
       setVipMessage(result.message ?? "");
+      setGodModeModel(result.model ?? null);
+      setGodModeDiagnostics(result.diagnostics ?? null);
       setVipPublishEnabled(Boolean(result.vipPublishEnabled));
       setVipJurisdictions(result.jurisdictions ?? []);
-      setApiMessage(result.picks?.length ? `${result.picks.length} value pick(s) found` : "No value picks at current prices");
+      setApiMessage(result.diagnostics?.grade ? `God Mode: ${result.diagnostics.grade} · ${result.diagnostics.signalScore}/100` : result.picks?.length ? `${result.picks.length} value pick(s) found` : "No value picks at current prices");
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "VIP preview failed");
     } finally {
@@ -3942,6 +3954,78 @@ function App() {
               </dl>
             </section>
 
+            <section>
+              <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
+                <div>
+                  <p className="eyebrow gold">God Mode</p>
+                  <h2 className="mt-1 text-ink">{godModeDiagnostics?.grade ?? "Awaiting market"}</h2>
+                </div>
+                <span className="figure text-[1.7rem] leading-none text-ink">
+                  {godModeDiagnostics ? `${godModeDiagnostics.signalScore}/100` : "—"}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-x-8 gap-y-4 py-5 border-b border-[var(--rule)]">
+                <Metric
+                  label="Model xG"
+                  value={godModeModel ? `${godModeModel.lambdaHome.toFixed(2)}–${godModeModel.lambdaAway.toFixed(2)}` : "—"}
+                />
+                <Metric
+                  label="Expected goals"
+                  value={godModeModel ? godModeModel.expectedTotal.toFixed(2) : "—"}
+                />
+                <Metric
+                  label="Exposure"
+                  value={godModeDiagnostics ? `${godModeDiagnostics.exposure.totalStake.toFixed(2)}u` : "—"}
+                />
+                <Metric
+                  label="Discipline"
+                  value={godModeDiagnostics?.exposure.capped ? "Capped" : godModeDiagnostics ? "Clear" : "—"}
+                />
+              </div>
+              <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] gap-x-12 gap-y-5 py-5">
+                <div>
+                  <p className="caption mb-2">Likeliest scores</p>
+                  <div className="grid gap-2">
+                    {(godModeModel?.topScorelines ?? []).slice(0, 4).map((score) => (
+                      <div key={score.score} className="grid grid-cols-[72px_minmax(0,1fr)] items-baseline border-b border-[var(--rule)] pb-2">
+                        <span className="figure text-ink">{score.score}</span>
+                        <span className="text-[0.9rem] text-[var(--ink-muted)]">{(score.prob * 100).toFixed(1)}%</span>
+                      </div>
+                    ))}
+                    {!godModeModel?.topScorelines?.length && (
+                      <p className="text-[0.9rem] text-[var(--ink-muted)]">Load odds and ratings to price the match.</p>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <p className="caption mb-2">Watchlist</p>
+                  <div className="grid gap-2">
+                    {(godModeDiagnostics?.watchlist ?? []).slice(0, 4).map((item, index) => (
+                      <div key={`${item.market}-${item.side}-${item.line ?? index}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 border-b border-[var(--rule)] pb-2">
+                        <span className="text-[0.9rem] text-ink truncate">
+                          {item.market}{item.line ? ` ${item.line}` : ""} · {item.label}
+                        </span>
+                        <span className="caption">
+                          {item.ev == null ? "No EV" : `${(item.ev * 100).toFixed(1)}% EV`}
+                        </span>
+                        <span className="col-span-2 text-[0.82rem] text-[var(--ink-muted)]">
+                          {item.reasons[0] ?? "Below publish threshold."}
+                        </span>
+                      </div>
+                    ))}
+                    {godModeDiagnostics?.riskFlags?.length ? (
+                      godModeDiagnostics.riskFlags.slice(0, 2).map((flag) => (
+                        <p key={flag} className="text-[0.86rem] text-[var(--ink-muted)]">{flag}</p>
+                      ))
+                    ) : null}
+                    {!godModeDiagnostics?.watchlist?.length && !godModeDiagnostics?.riskFlags?.length && (
+                      <p className="text-[0.9rem] text-[var(--ink-muted)]">No watchlist friction on the current board.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+
             {/* Picks list */}
             <section>
               <div className="flex items-baseline justify-between pb-3 border-b border-[var(--rule-strong)]">
@@ -3974,8 +4058,8 @@ function App() {
                         <p className="caption mt-1">{pick.bookName} @ <span className="figure">{pick.bookPrice.toFixed(2)}</span></p>
                       </div>
                       <div>
-                        <p className="caption">Model vs implied</p>
-                        <p className="mt-1 text-ink"><span className="figure">{(pick.modelProb * 100).toFixed(1)}%</span> <span className="text-[var(--ink-quiet)]">/ {(pick.impliedProb * 100).toFixed(1)}%</span></p>
+                        <p className="caption">Model vs fair</p>
+                        <p className="mt-1 text-ink"><span className="figure">{(pick.modelProb * 100).toFixed(1)}%</span> <span className="text-[var(--ink-quiet)]">/ {((pick.fairProb ?? pick.impliedProb) * 100).toFixed(1)}%</span></p>
                       </div>
                       <div>
                         <p className="caption">Stake · confidence</p>
@@ -4020,7 +4104,7 @@ function App() {
               <div>
                 <p className="eyebrow pitch">Stake discipline</p>
                 <p className="mt-2 text-[0.92rem] leading-[1.55] text-[var(--ink-muted)]">
-                  Stake = 0.25 × full Kelly, capped at 2u, floor 0.25u. Anything below the floor publishes as zero — the channel stays small and disciplined.
+                  Stake = {(godModeDiagnostics?.thresholds.kellyFraction ?? 0.25).toFixed(2)} × full Kelly, capped by per-pick and total-exposure limits. Anything below the floor publishes as zero — the channel stays small and disciplined.
                 </p>
               </div>
               <div>

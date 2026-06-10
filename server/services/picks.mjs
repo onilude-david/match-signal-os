@@ -227,6 +227,89 @@ const confidenceFor = (ev, edge) => {
   return "Low";
 };
 
+const summarizeCandidate = (candidate, { minEv, minEdge }) => {
+  const price = num(candidate.bookPrice);
+  const ev = price && price > 1 ? expectedValue(candidate.modelProb, price) : null;
+  const edge = ev === null ? null : candidate.fairProb == null ? ev : candidate.modelProb - candidate.fairProb;
+  const stakeUnits = ev === null ? 0 : kellyStake(candidate.modelProb, price);
+  const reasons = [];
+  if (!price || price <= 1) reasons.push("No usable price.");
+  if (ev === null || ev < minEv) reasons.push(`EV below ${(minEv * 100).toFixed(1)}% threshold.`);
+  if (edge === null || edge < minEdge) reasons.push(`Model edge below ${(minEdge * 100).toFixed(1)}pp threshold.`);
+  if (stakeUnits <= 0) reasons.push("Kelly stake below floor.");
+
+  return {
+    market: candidate.market,
+    side: candidate.side,
+    label: candidate.label,
+    line: candidate.line ?? null,
+    modelProb: round4(candidate.modelProb),
+    fairProb: candidate.fairProb,
+    edge: edge == null ? null : round4(edge),
+    bookName: candidate.bookName,
+    bookPrice: price,
+    impliedProb: price ? round4(decimalToImpliedProb(price)) : null,
+    ev: ev == null ? null : round4(ev),
+    stakeUnits,
+    confidence: ev == null || edge == null ? "Low" : confidenceFor(ev, edge),
+    status: reasons.length ? "watchlist" : "qualified",
+    reasons,
+  };
+};
+
+const buildDiagnostics = ({ fixture, model, candidates, picks, totalStake, minEv, minEdge, maxExposureUnits, exposureLimited }) => {
+  const has1x2Odds = Boolean(num(fixture?.homeOdds) && num(fixture?.awayOdds));
+  const missingRatings = [];
+  if (!model?.strengths?.home?.hasRating) missingRatings.push(fixture?.teamA ?? "home team");
+  if (!model?.strengths?.away?.hasRating) missingRatings.push(fixture?.teamB ?? "away team");
+
+  const watchlist = candidates
+    .map((candidate) => summarizeCandidate(candidate, { minEv, minEdge }))
+    .filter((candidate) => candidate.status !== "qualified")
+    .sort((a, b) => (b.ev ?? -1) - (a.ev ?? -1))
+    .slice(0, 6);
+
+  const marketDiagnostics = candidates
+    .map((candidate) => summarizeCandidate(candidate, { minEv, minEdge }))
+    .sort((a, b) => (b.ev ?? -1) - (a.ev ?? -1))
+    .slice(0, 12);
+
+  const riskFlags = [];
+  if (!has1x2Odds && !candidates.length) riskFlags.push("No odds loaded for this fixture.");
+  if (missingRatings.length) riskFlags.push(`Missing team rating: ${missingRatings.join(", ")}.`);
+  if (!picks.length && candidates.length) riskFlags.push("Market is priced efficiently at current thresholds.");
+  if (exposureLimited) riskFlags.push(`Exposure capped at ${maxExposureUnits.toFixed(2)}u.`);
+
+  const topEdge = picks[0]?.edge ?? 0;
+  const topEv = picks[0]?.ev ?? 0;
+  const signalScore = Math.round(Math.max(0, Math.min(100, topEv * 420 + topEdge * 260 + Math.min(totalStake, maxExposureUnits) * 6)));
+  const grade = picks.length
+    ? signalScore >= 70 ? "Attack"
+      : signalScore >= 45 ? "Measured"
+        : "Small edge"
+    : candidates.length ? "No bet" : "Needs odds";
+
+  return {
+    grade,
+    signalScore,
+    thresholds: {
+      minEv,
+      minEdge,
+      maxExposureUnits,
+      kellyFraction: Number(process.env.KELLY_FRACTION ?? 0.25),
+      unitBankrollPct: Number(process.env.UNIT_BANKROLL_PCT ?? 1),
+    },
+    exposure: {
+      totalStake,
+      pickCount: picks.length,
+      capped: exposureLimited,
+    },
+    riskFlags,
+    watchlist,
+    marketDiagnostics,
+  };
+};
+
 // Build VIP value picks for a fixture across every available market.
 //
 // opts:
@@ -243,9 +326,10 @@ const runPipeline = (fixture, teamRatings, {
   minEv = Number(process.env.MIN_EV ?? 0.04),
   minEdge = Number(process.env.MIN_EDGE ?? 0.02),
   maxPicks = Number(process.env.MAX_PICKS_PER_FIXTURE ?? 4),
+  maxExposureUnits = Number(process.env.MAX_TOTAL_EXPOSURE_UNITS ?? 6),
   bookName = "Book",
 } = {}) => {
-  if (!fixture) return { model: null, picks: [] };
+  if (!fixture) return { model: null, picks: [], diagnostics: null };
 
   // Price the exact totals lines the books are offering so model and market
   // line up; default to the standard lines otherwise.
@@ -256,20 +340,21 @@ const runPipeline = (fixture, teamRatings, {
 
   const candidates = buildCandidates(fixture, model, odds, bookName);
 
-  const picks = [];
+  const rawPicks = [];
   for (const c of candidates) {
-    const price = num(c.bookPrice);
+    const summary = summarizeCandidate(c, { minEv, minEdge });
+    const price = summary.bookPrice;
     if (!price || price <= 1) continue;
-    const ev = expectedValue(c.modelProb, price);
+    const ev = summary.ev;
     if (ev === null || ev < minEv) continue;
     // Discipline gate: only bet when the model beats the de-vigged fair price.
-    const edge = c.fairProb == null ? ev : c.modelProb - c.fairProb;
+    const edge = summary.edge;
     if (edge < minEdge) continue;
-    const stakeUnits = kellyStake(c.modelProb, price);
+    const stakeUnits = summary.stakeUnits;
     if (stakeUnits <= 0) continue;
 
     const sideKey = `${c.market}_${c.side}${c.line ? `_${c.line}` : ""}`.toLowerCase().replace(/[^a-z0-9]+/g, "_");
-    picks.push({
+    rawPicks.push({
       id: `pick_${fixture.id}_${sideKey}`,
       fixtureId: fixture.id,
       market: c.market,
@@ -290,8 +375,30 @@ const runPipeline = (fixture, teamRatings, {
     });
   }
 
-  const ranked = picks.sort((a, b) => b.ev - a.ev).slice(0, Math.max(1, maxPicks));
-  return { model, picks: ranked };
+  const ranked = rawPicks.sort((a, b) => b.ev - a.ev).slice(0, Math.max(1, maxPicks));
+  const picks = [];
+  let totalStake = 0;
+  let exposureLimited = false;
+  for (const pick of ranked) {
+    if (totalStake + pick.stakeUnits > maxExposureUnits) {
+      exposureLimited = true;
+      continue;
+    }
+    picks.push(pick);
+    totalStake = Number((totalStake + pick.stakeUnits).toFixed(2));
+  }
+  const diagnostics = buildDiagnostics({
+    fixture,
+    model,
+    candidates,
+    picks,
+    totalStake,
+    minEv,
+    minEdge,
+    maxExposureUnits,
+    exposureLimited,
+  });
+  return { model, picks, diagnostics };
 };
 
 // Back-compat: returns a plain Pick[] (safe to JSON.stringify). Most callers
@@ -304,7 +411,7 @@ export const computePicks = (fixture, teamRatings, opts = {}) =>
 // exposure, and the ready-to-send VIP message. Serialization-safe (no props
 // attached to arrays).
 export const analyzeFixture = (fixture, teamRatings, opts = {}) => {
-  const { model, picks } = runPipeline(fixture, teamRatings, opts);
+  const { model, picks, diagnostics } = runPipeline(fixture, teamRatings, opts);
   const snapshot = model
     ? {
         lambdaHome: model.lambdaHome,
@@ -320,6 +427,7 @@ export const analyzeFixture = (fixture, teamRatings, opts = {}) => {
     model: snapshot,
     picks,
     totalStake,
+    diagnostics,
     message: buildVipMessage(fixture, picks, snapshot),
   };
 };

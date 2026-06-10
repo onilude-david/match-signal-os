@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readSupabaseSnapshot, persistGeneratedContent, normalizeAiContent } from "./supabase.mjs";
 import { generateGeminiContent } from "./gemini.mjs";
-import { computePicks, buildVipMessage } from "./picks.mjs";
+import { analyzeFixture } from "./picks.mjs";
 import { publicSafetyCheck } from "./safetyFilter.mjs";
 
 const vipPublishingEnabled = () => {
@@ -551,7 +551,8 @@ export const handleTelegramCallback = async (callbackQuery) => {
     }
     // Picks come from server-side EV math, not from the model's freeform text.
     const teamRatings = state.ratings ?? [];
-    const picks = computePicks(match, teamRatings);
+    const analysis = analyzeFixture(match, teamRatings);
+    const { picks } = analysis;
     if (!picks.length) {
       await telegramSendMessage({
         chatId,
@@ -559,7 +560,7 @@ export const handleTelegramCallback = async (callbackQuery) => {
       });
       return;
     }
-    const message = buildVipMessage(match, picks);
+    const message = analysis.message;
     try {
       await telegramSendMessage({
         chatId: process.env.TELEGRAM_BETTING_CHANNEL_ID,

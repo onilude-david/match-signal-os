@@ -136,10 +136,29 @@ describe("computePicks", () => {
     expect(out.model.markets.oneXtwo.home).toBeGreaterThan(0);
     expect(Array.isArray(out.picks)).toBe(true);
     expect(out.totalStake).toBeGreaterThanOrEqual(0);
+    expect(out.diagnostics.signalScore).toBeGreaterThanOrEqual(0);
+    expect(out.diagnostics.thresholds.minEv).toBe(0.04);
+    expect(Array.isArray(out.diagnostics.marketDiagnostics)).toBe(true);
     if (out.picks.length) {
       expect(out.message).toContain("Strong vs Weak");
       expect(out.message).toContain("Model xG");
     }
+  });
+
+  it("returns no-bet diagnostics when prices do not clear the thresholds", () => {
+    const fixture = { id: "m7", teamA: "Strong", teamB: "Weak", homeOdds: 1.01, drawOdds: 1.01, awayOdds: 1.01 };
+    const out = analyzeFixture(fixture, ratings);
+    expect(out.picks).toEqual([]);
+    expect(["No bet", "Needs odds"]).toContain(out.diagnostics.grade);
+    expect(out.diagnostics.watchlist.length).toBeGreaterThan(0);
+    expect(out.diagnostics.riskFlags.length).toBeGreaterThan(0);
+  });
+
+  it("caps total exposure across ranked picks", () => {
+    const fixture = { id: "m8", teamA: "Strong", teamB: "Weak", homeOdds: 2.0, drawOdds: 4.0, awayOdds: 8.0 };
+    const out = analyzeFixture(fixture, ratings, { maxExposureUnits: 0.5 });
+    expect(out.totalStake).toBeLessThanOrEqual(0.5);
+    expect(out.diagnostics.exposure.totalStake).toBe(out.totalStake);
   });
 
   it("prices Over/Under from line-shopped odds and uses the best book", () => {

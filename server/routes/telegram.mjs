@@ -11,7 +11,7 @@ import {
   handleTelegramUpdate,
 } from "../services/telegram.mjs";
 import { publicSafetyMiddleware, publicSafetyCheck } from "../services/safetyFilter.mjs";
-import { computePicks, buildVipMessage, responsibleGamblingFooter } from "../services/picks.mjs";
+import { analyzeFixture, responsibleGamblingFooter } from "../services/picks.mjs";
 
 const router = express.Router();
 
@@ -295,12 +295,14 @@ router.post("/vip/preview", async (req, res) => {
   if (!fixture) {
     return jsonError(res, 400, "fixture is required.");
   }
-  const picks = computePicks(fixture, teamRatings);
-  const message = buildVipMessage(fixture, picks);
+  const analysis = analyzeFixture(fixture, teamRatings);
   res.json({
     ok: true,
-    picks,
-    message,
+    picks: analysis.picks,
+    message: analysis.message,
+    model: analysis.model,
+    diagnostics: analysis.diagnostics,
+    totalStake: analysis.totalStake,
     vipPublishEnabled: vipPublishingEnabled(),
     jurisdictions: String(process.env.VIP_JURISDICTIONS ?? "").trim().split(",").map((s) => s.trim()).filter(Boolean),
   });
@@ -331,16 +333,18 @@ router.post("/vip", async (req, res) => {
     return jsonError(res, 400, "fixture is required.");
   }
 
-  const picks = computePicks(fixture, teamRatings);
+  const analysis = analyzeFixture(fixture, teamRatings);
+  const { picks } = analysis;
   if (!picks.length) {
     return res.status(200).json({
       ok: false,
       published: false,
       reason: "No value picks at current prices. Nothing was published.",
+      diagnostics: analysis.diagnostics,
     });
   }
 
-  const baseMessage = buildVipMessage(fixture, picks);
+  const baseMessage = analysis.message;
   const message = narrative ? `${baseMessage}\n\nNote: ${narrative}` : baseMessage;
 
   try {
@@ -366,6 +370,9 @@ router.post("/vip", async (req, res) => {
       published: true,
       pickCount: picks.length,
       picks,
+      model: analysis.model,
+      diagnostics: analysis.diagnostics,
+      totalStake: analysis.totalStake,
       audit,
       result,
     });
