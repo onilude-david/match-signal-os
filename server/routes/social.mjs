@@ -3,9 +3,11 @@ import { assertEnv, jsonError } from "../config/env.mjs";
 import {
   configuredSocialVendors,
   normalizeSocialPayload,
+  planBufferPublish,
   publishWithSocialVendor,
   officialSocialApis,
   inspectBufferChannels,
+  socialVendors,
 } from "../services/social.mjs";
 import { publicSafetyCheck } from "../services/safetyFilter.mjs";
 
@@ -57,6 +59,36 @@ router.post("/social/publish", async (req, res) => {
   }
 
   if (dryRun) {
+    if (provider === "buffer" && process.env.BUFFER_API_KEY) {
+      try {
+        const baseUrl = (process.env.BUFFER_BASE_URL || socialVendors.buffer.defaultBaseUrl).replace(/\/$/, "");
+        const plan = await planBufferPublish({
+          apiKey: process.env.BUFFER_API_KEY,
+          baseUrl,
+          payload,
+        });
+        if (!plan.ok) {
+          return res.status(409).json({
+            ok: false,
+            dryRun: true,
+            provider,
+            payload,
+            plan,
+            error: "Buffer dry run found unavailable targets.",
+          });
+        }
+        return res.json({
+          ok: true,
+          dryRun: true,
+          provider,
+          payload,
+          plan,
+          note: "Dry run only. These Buffer channels are connected and ready for a text-only queued post.",
+        });
+      } catch (error) {
+        return jsonError(res, 502, "Buffer dry run failed.", error.message);
+      }
+    }
     res.json({
       ok: true,
       dryRun: true,

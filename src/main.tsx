@@ -2071,12 +2071,18 @@ function App() {
   const socialDryRun = async () => {
     setLoading((prev) => ({ ...prev, socialDryRun: true }));
     try {
-      const result = await api<{ ok: boolean; provider: string; payload: { platforms: string[] }; dryRun: boolean }>("/api/social/publish", {
+      const result = await api<{
+        ok: boolean;
+        provider: string;
+        payload: { platforms: string[] };
+        dryRun: boolean;
+        plan?: { targets?: Array<{ service: string; name: string }> };
+      }>("/api/social/publish", {
         method: "POST",
         body: JSON.stringify({
-          provider: "postproxy",
+          provider: "buffer",
           dryRun: true,
-          platforms: ["instagram", "x", "youtube", "tiktok", "threads", "bluesky"],
+          platforms: ["instagram", "x", "tiktok"],
           text: content.xPost,
           title: content.videoTitle,
           matchId: selectedFixture.id,
@@ -2086,7 +2092,8 @@ function App() {
           },
         }),
       });
-      setApiMessage(`Social dry run ready for ${result.payload.platforms.length} platform(s) via ${result.provider}`);
+      const targetCount = result.plan?.targets?.length ?? result.payload.platforms.length;
+      setApiMessage(`Buffer dry run ready for ${targetCount} connected channel(s)`);
     } catch (error) {
       setApiMessage(error instanceof Error ? error.message : "Social dry run failed");
     } finally {
@@ -3018,14 +3025,14 @@ function App() {
                   <p className="eyebrow pitch">Channel readiness</p>
                   <h2 className="mt-1 text-ink">Connected social stack</h2>
                 </div>
-                <span className="caption">4 channels</span>
+                <span className="caption">3 connected</span>
               </div>
               <div className="mt-2 grid gap-0">
                 {[
                   ["Instagram", "Media required", "Connected via Buffer"],
                   ["X", "Text draft tested", "Buffer write works"],
                   ["TikTok", "Video required", "Connected via Buffer"],
-                  ["YouTube", "Short + banner ready", "Connect in Buffer next"],
+                  ["YouTube", "Short + banner ready", "Not connected"],
                 ].map(([channel, requirement, status]) => (
                   <div key={channel} className="grid grid-cols-[180px_minmax(0,1fr)_auto] items-baseline gap-4 py-4 border-b border-[var(--rule)]">
                     <strong className="text-[1rem] font-medium text-ink font-display [font-variation-settings:'opsz'_60]">{channel}</strong>

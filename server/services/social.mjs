@@ -113,6 +113,38 @@ const PLATFORM_ALIASES = {
 
 const canonicalPlatform = (raw) => PLATFORM_ALIASES[String(raw ?? "").trim().toLowerCase()] ?? null;
 
+export const planBufferPublish = async ({ apiKey, baseUrl, payload, force = false }) => {
+  const cache = await getBufferChannels({ apiKey, baseUrl, force });
+  const requested = payload.platforms ?? [];
+  const resolved = requested.map((platform) => ({
+    requested: platform,
+    service: canonicalPlatform(platform),
+  }));
+  const unknown = resolved.filter((item) => !item.service).map((item) => item.requested);
+  const services = [...new Set(resolved.map((item) => item.service).filter(Boolean))];
+  const missing = services.filter((service) => !cache.channelsByService[service]?.length);
+  const targets = services
+    .flatMap((service) => (cache.channelsByService[service] ?? []).map((channel) => ({
+      service,
+      channelId: channel.id,
+      name: channel.name,
+    })));
+  const mediaBlocked = (payload.mediaUrls ?? []).length > 0;
+  const ok = !unknown.length && !missing.length && !mediaBlocked && targets.length > 0;
+
+  return {
+    ok,
+    organizationId: cache.organizationId,
+    requested,
+    services,
+    targets,
+    unknown,
+    missing,
+    mediaBlocked,
+    connectedServices: Object.keys(cache.channelsByService),
+  };
+};
+
 const bufferGraphql = async ({ apiKey, baseUrl, query, variables }) => {
   const response = await fetch(`${baseUrl}/graphql`, {
     method: "POST",
@@ -167,24 +199,18 @@ const getBufferChannels = async ({ apiKey, baseUrl, force = false }) => {
 };
 
 const publishWithBuffer = async ({ apiKey, baseUrl, payload }) => {
-  const cache = await getBufferChannels({ apiKey, baseUrl });
-
-  // Map requested platforms → channelIds. We only support text-only posts
-  // here; media uploads require Buffer's separate asset-upload flow, which
-  // is documented but not wired (TODO).
-  const requested = (payload.platforms ?? []).map(canonicalPlatform).filter(Boolean);
-  const unique = [...new Set(requested)];
-  if (!unique.length) {
-    throw new Error(`No recognised Buffer platform in: ${JSON.stringify(payload.platforms ?? [])}. Connected services: ${Object.keys(cache.channelsByService).join(", ") || "none"}`);
+  const plan = await planBufferPublish({ apiKey, baseUrl, payload });
+  if (plan.unknown.length) {
+    throw new Error(`No recognised Buffer platform in: ${plan.unknown.join(", ")}. Connected services: ${plan.connectedServices.join(", ") || "none"}`);
   }
-
-  const missing = unique.filter((service) => !cache.channelsByService[service]?.length);
-  if (missing.length) {
-    throw new Error(`Buffer has no connected channel for: ${missing.join(", ")}. Connected services: ${Object.keys(cache.channelsByService).join(", ")}`);
+  if (plan.missing.length) {
+    throw new Error(`Buffer has no connected channel for: ${plan.missing.join(", ")}. Connected services: ${plan.connectedServices.join(", ")}`);
   }
-
-  if ((payload.mediaUrls ?? []).length) {
+  if (plan.mediaBlocked) {
     throw new Error("Buffer media upload is not wired in this adapter yet — send text-only here, or attach media in Buffer UI after queueing. Set mediaUrls=[] to proceed.");
+  }
+  if (!plan.targets.length) {
+    throw new Error(`No Buffer target channels resolved. Connected services: ${plan.connectedServices.join(", ") || "none"}`);
   }
 
   // Default to addToQueue (safest — goes into Buffer's normal scheduling
@@ -211,40 +237,38 @@ const publishWithBuffer = async ({ apiKey, baseUrl, payload }) => {
   }`;
 
   const results = [];
-  for (const service of unique) {
-    for (const channel of cache.channelsByService[service]) {
-      const input = {
-        channelId: channel.id,
-        text: payload.text || "",
-        schedulingType,
-        mode,
-        assets: [],
-        source: "match-signal-os",
-        ...(dueAt ? { dueAt } : {}),
-      };
-      try {
-        const data = await bufferGraphql({
-          apiKey,
-          baseUrl,
-          query: mutation,
-          variables: { input },
-        });
-        results.push({
-          channelId: channel.id,
-          service: channel.service,
-          name: channel.name,
-          ok: data?.createPost?.__typename === "PostActionSuccess",
-          result: data?.createPost,
-        });
-      } catch (error) {
-        results.push({
-          channelId: channel.id,
-          service: channel.service,
-          name: channel.name,
-          ok: false,
-          error: error.message,
-        });
-      }
+  for (const channel of plan.targets) {
+    const input = {
+      channelId: channel.channelId,
+      text: payload.text || "",
+      schedulingType,
+      mode,
+      assets: [],
+      source: "match-signal-os",
+      ...(dueAt ? { dueAt } : {}),
+    };
+    try {
+      const data = await bufferGraphql({
+        apiKey,
+        baseUrl,
+        query: mutation,
+        variables: { input },
+      });
+      results.push({
+        channelId: channel.channelId,
+        service: channel.service,
+        name: channel.name,
+        ok: data?.createPost?.__typename === "PostActionSuccess",
+        result: data?.createPost,
+      });
+    } catch (error) {
+      results.push({
+        channelId: channel.channelId,
+        service: channel.service,
+        name: channel.name,
+        ok: false,
+        error: error.message,
+      });
     }
   }
 
@@ -259,7 +283,7 @@ const publishWithBuffer = async ({ apiKey, baseUrl, payload }) => {
   const allOk = enriched.every((r) => r.ok);
   return {
     provider: "buffer",
-    organizationId: cache.organizationId,
+    organizationId: plan.organizationId,
     mode,
     schedulingType,
     ok: allOk,
